@@ -43,6 +43,7 @@ import jdk.graal.compiler.nodeinfo.NodeCycles;
 import jdk.graal.compiler.nodeinfo.NodeInfo;
 import jdk.graal.compiler.nodeinfo.NodeSize;
 import jdk.graal.compiler.nodeinfo.Verbosity;
+import jdk.graal.compiler.nodes.memory.MultiMemoryKill;
 import jdk.graal.compiler.nodes.memory.SingleMemoryKill;
 import jdk.graal.compiler.nodes.spi.LIRLowerable;
 import jdk.graal.compiler.nodes.spi.NodeLIRBuilderTool;
@@ -66,7 +67,7 @@ import jdk.vm.ci.code.BytecodeFrame;
           cycles = CYCLES_UNKNOWN, cyclesRationale = CYCLES_UNKNOWN_RATIONALE,
           size   = SIZE_UNKNOWN,   sizeRationale   = SIZE_UNKNOWN_RATIONALE)
 // @formatter:on
-public final class InvokeWithExceptionNode extends WithExceptionNode implements Invoke, IterableNodeType, SingleMemoryKill, LIRLowerable, UncheckedInterfaceProvider, Simplifiable {
+public final class InvokeWithExceptionNode extends WithExceptionNode implements Invoke, IterableNodeType, SingleMemoryKill, MultiMemoryKill, LIRLowerable, UncheckedInterfaceProvider, Simplifiable {
     public static final NodeClass<InvokeWithExceptionNode> TYPE = NodeClass.create(InvokeWithExceptionNode.class);
 
     @OptionalInput ValueNode classInit;
@@ -77,6 +78,8 @@ public final class InvokeWithExceptionNode extends WithExceptionNode implements 
     protected boolean polymorphic;
     protected InlineControl inlineControl;
     private boolean isInOOMETry;
+    /** What this invoke kills, a canonical {@link Invoke#killSet}: all of memory unless narrowed. */
+    protected LocationIdentity[] killedLocations = KILLS_ANY;
 
     public InvokeWithExceptionNode(CallTargetNode callTarget, AbstractBeginNode exceptionEdge, int bci) {
         this(callTarget, exceptionEdge, bci, callTarget.returnStamp().getTrustedStamp());
@@ -174,7 +177,27 @@ public final class InvokeWithExceptionNode extends WithExceptionNode implements 
 
     @Override
     public LocationIdentity getKilledLocationIdentity() {
-        return LocationIdentity.any();
+        return Invoke.singleKill(killedLocations);
+    }
+
+    @Override
+    public LocationIdentity[] getKilledLocationIdentities() {
+        return killedLocations;
+    }
+
+    @Override
+    public void setKilledLocationIdentities(LocationIdentity... locations) {
+        this.killedLocations = Invoke.killSet(locations);
+    }
+
+    @Override
+    public boolean killsInit() {
+        for (LocationIdentity location : killedLocations) {
+            if (location.isInit()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     @Override
@@ -232,6 +255,7 @@ public final class InvokeWithExceptionNode extends WithExceptionNode implements 
     public InvokeNode replaceWithInvoke() {
         try (InliningLog.UpdateScope updateScope = InliningLog.openUpdateScopeTrackingReplacement(graph().getInliningLog(), this)) {
             InvokeNode newInvoke = graph().add(new InvokeNode(callTarget, bci, stamp, this.getKilledLocationIdentity()));
+            newInvoke.setKilledLocationIdentities(killedLocations);
             newInvoke.setStateAfter(stateAfter);
             newInvoke.setStateDuring(stateDuring);
             newInvoke.setInlineControl(inlineControl);

@@ -24,8 +24,14 @@
  */
 package jdk.graal.compiler.nodes;
 
+import java.util.ArrayList;
+import java.util.List;
+
+import org.graalvm.word.LocationIdentity;
+
 import jdk.graal.compiler.graph.Node;
 import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderContext;
+import jdk.graal.compiler.nodes.memory.MemoryKill;
 import jdk.graal.compiler.nodes.memory.SingleMemoryKill;
 import jdk.graal.compiler.nodes.spi.Lowerable;
 import jdk.graal.compiler.nodes.type.StampTool;
@@ -36,6 +42,41 @@ public interface Invoke extends StateSplit, Lowerable, SingleMemoryKill, Deoptim
 
     String CYCLES_UNKNOWN_RATIONALE = "Cannot estimate the runtime cost of a call; it's a blackhole.";
     String SIZE_UNKNOWN_RATIONALE = "Can only dynamically decide how much code is generated based on the type of a call (special, static, virtual, interface).";
+
+    /** What an invoke kills unless narrowed: all of memory. */
+    LocationIdentity[] KILLS_ANY = {LocationIdentity.any()};
+
+    /**
+     * A canonical kill set: {@link #KILLS_ANY} when the locations include
+     * {@link LocationIdentity#any()}, otherwise the locations without duplicates and without
+     * {@link MemoryKill#NO_LOCATION}.
+     */
+    static LocationIdentity[] killSet(LocationIdentity... locations) {
+        List<LocationIdentity> set = new ArrayList<>(locations.length);
+        for (LocationIdentity location : locations) {
+            if (location.isAny()) {
+                return KILLS_ANY;
+            }
+            if (!location.equals(MemoryKill.NO_LOCATION) && !set.contains(location)) {
+                set.add(location);
+            }
+        }
+        return set.isEmpty() ? MemoryKill.MULTI_KILL_NO_LOCATION : set.toArray(new LocationIdentity[0]);
+    }
+
+    /**
+     * The one location a kill set kills, as code that only knows single kills sees it:
+     * {@link MemoryKill#NO_LOCATION} for none, {@link LocationIdentity#any()} for two or more.
+     */
+    static LocationIdentity singleKill(LocationIdentity[] locations) {
+        return locations.length == 0 ? MemoryKill.NO_LOCATION : locations.length == 1 ? locations[0] : LocationIdentity.any();
+    }
+
+    /**
+     * Narrows the locations this invoke kills to those its callees may write. With none it is no
+     * memory kill at all, with one a single kill, and with two or more a multi kill.
+     */
+    void setKilledLocationIdentities(LocationIdentity... locations);
 
     enum InlineControl {
         Normal(true, true),

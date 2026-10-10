@@ -37,6 +37,7 @@ import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.List;
+import java.util.Objects;
 
 import org.graalvm.word.LocationIdentity;
 
@@ -480,7 +481,7 @@ public abstract class DefaultJavaLoweringProvider implements LoweringProvider, V
         AddressNode address = createFieldAddress(graph, object, field);
 
         BarrierType barrierType = barrierSet.fieldReadBarrierType(field, getStorageKind(field));
-        ReadNode memoryRead = graph.add(new ReadNode(address, overrideFieldLocationIdentity(loadField.getLocationIdentity()),
+        ReadNode memoryRead = graph.add(new ReadNode(address, fieldAccessLocation(loadField.getLocationIdentity()),
                         loadStamp, barrierType, loadField.getMemoryOrder(), loadField.field(), loadField.trustInjected()));
         ValueNode readValue = implicitLoadConvert(graph, getStorageKind(field), memoryRead);
         loadField.replaceAtUsages(readValue);
@@ -496,7 +497,7 @@ public abstract class DefaultJavaLoweringProvider implements LoweringProvider, V
         AddressNode address = createFieldAddress(graph, object, field);
 
         BarrierType barrierType = barrierSet.fieldWriteBarrierType(field, getStorageKind(field));
-        WriteNode memoryWrite = graph.add(new WriteNode(address, overrideFieldLocationIdentity(storeField.getLocationIdentity()), value, barrierType, storeField.getMemoryOrder()));
+        WriteNode memoryWrite = graph.add(new WriteNode(address, fieldAccessLocation(storeField.getLocationIdentity()), value, barrierType, storeField.getMemoryOrder()));
         memoryWrite.setStateAfter(storeField.stateAfter());
         graph.replaceFixedWithFixed(storeField, memoryWrite);
     }
@@ -1283,6 +1284,18 @@ public abstract class DefaultJavaLoweringProvider implements LoweringProvider, V
 
     public FieldLocationIdentity overrideFieldLocationIdentity(FieldLocationIdentity fieldIdentity) {
         return fieldIdentity;
+    }
+
+    /**
+     * The location of a lowered field access: the overridden one, in the access's partition if it
+     * has one, since an override such as Native Image's makes a new location from the field.
+     */
+    private FieldLocationIdentity fieldAccessLocation(FieldLocationIdentity location) {
+        FieldLocationIdentity overridden = overrideFieldLocationIdentity(location);
+        if (location.getPartition() == null || Objects.equals(location.getPartition(), overridden.getPartition())) {
+            return overridden;
+        }
+        return new FieldLocationIdentity(overridden.getField(), overridden.isImmutable(), location.getPartition());
     }
 
     public abstract ValueNode staticFieldBase(StructuredGraph graph, ResolvedJavaField field, LoweringTool tool);

@@ -50,7 +50,7 @@ public abstract class AccessFieldNode extends FixedWithNextNode implements Lower
 
     public static final NodeClass<AccessFieldNode> TYPE = NodeClass.create(AccessFieldNode.class);
     @OptionalInput ValueNode object;
-    protected final FieldLocationIdentity location;
+    protected FieldLocationIdentity location;
     protected final ResolvedJavaField field;
     protected final MemoryOrderMode memoryOrder;
 
@@ -94,6 +94,15 @@ public abstract class AccessFieldNode extends FixedWithNextNode implements Lower
     @Override
     public FieldLocationIdentity getLocationIdentity() {
         return location;
+    }
+
+    /**
+     * Gives this access a location of its own, such as the field in one partition of the objects
+     * that have it ({@link FieldLocationIdentity#getPartition()}).
+     */
+    public void setLocationIdentity(FieldLocationIdentity newLocation) {
+        assert newLocation.getField().equals(field) : newLocation + " is no location of " + field;
+        this.location = newLocation;
     }
 
     /**

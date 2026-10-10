@@ -51,6 +51,7 @@ import jdk.graal.compiler.nodeinfo.NodeInfo;
 import jdk.graal.compiler.nodeinfo.NodeSize;
 import jdk.graal.compiler.nodeinfo.Verbosity;
 import jdk.graal.compiler.nodes.memory.AbstractMemoryCheckpoint;
+import jdk.graal.compiler.nodes.memory.MultiMemoryKill;
 import jdk.graal.compiler.nodes.memory.SingleMemoryKill;
 import jdk.graal.compiler.nodes.spi.LIRLowerable;
 import jdk.graal.compiler.nodes.spi.NodeLIRBuilderTool;
@@ -68,7 +69,7 @@ import jdk.vm.ci.code.BytecodeFrame;
           cycles = CYCLES_UNKNOWN, cyclesRationale = CYCLES_UNKNOWN_RATIONALE,
           size   = SIZE_UNKNOWN,   sizeRationale   = SIZE_UNKNOWN_RATIONALE)
 // @formatter:on
-public final class InvokeNode extends AbstractMemoryCheckpoint implements Invoke, LIRLowerable, SingleMemoryKill, UncheckedInterfaceProvider {
+public final class InvokeNode extends AbstractMemoryCheckpoint implements Invoke, LIRLowerable, SingleMemoryKill, MultiMemoryKill, UncheckedInterfaceProvider {
     public static final NodeClass<InvokeNode> TYPE = NodeClass.create(InvokeNode.class);
 
     @OptionalInput ValueNode classInit;
@@ -77,7 +78,8 @@ public final class InvokeNode extends AbstractMemoryCheckpoint implements Invoke
     protected int bci;
     protected boolean polymorphic;
     protected InlineControl inlineControl;
-    protected final LocationIdentity identity;
+    /** What this invoke kills, a canonical {@link Invoke#killSet}. */
+    protected LocationIdentity[] killedLocations;
     private boolean isInOOMETry;
     private boolean sideEffect;
 
@@ -99,7 +101,7 @@ public final class InvokeNode extends AbstractMemoryCheckpoint implements Invoke
         this.bci = bci;
         this.polymorphic = false;
         this.inlineControl = InlineControl.Normal;
-        this.identity = identity;
+        this.killedLocations = Invoke.killSet(identity);
         this.sideEffect = super.hasSideEffect();
     }
 
@@ -149,7 +151,27 @@ public final class InvokeNode extends AbstractMemoryCheckpoint implements Invoke
 
     @Override
     public LocationIdentity getKilledLocationIdentity() {
-        return identity;
+        return Invoke.singleKill(killedLocations);
+    }
+
+    @Override
+    public LocationIdentity[] getKilledLocationIdentities() {
+        return killedLocations;
+    }
+
+    @Override
+    public void setKilledLocationIdentities(LocationIdentity... locations) {
+        this.killedLocations = Invoke.killSet(locations);
+    }
+
+    @Override
+    public boolean killsInit() {
+        for (LocationIdentity location : killedLocations) {
+            if (location.isInit()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     @Override

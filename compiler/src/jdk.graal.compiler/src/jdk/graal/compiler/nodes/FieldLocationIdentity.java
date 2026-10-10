@@ -35,14 +35,32 @@ public class FieldLocationIdentity extends LocationIdentity implements FormatWit
 
     private final ResolvedJavaField inner;
     private final boolean immutable;
+    /** Which part of the field this is, null for all of it: see {@link #getPartition()}. */
+    private final Object partition;
 
     public FieldLocationIdentity(ResolvedJavaField inner) {
         this(inner, false);
     }
 
     public FieldLocationIdentity(ResolvedJavaField inner, boolean immutable) {
+        this(inner, immutable, null);
+    }
+
+    public FieldLocationIdentity(ResolvedJavaField inner, boolean immutable, Object partition) {
         this.inner = inner;
         this.immutable = immutable;
+        this.partition = partition;
+    }
+
+    /**
+     * The partition of the objects that have the field this location stands for, or null for all
+     * of them. A points-to analysis can split a field's objects into partitions that no access
+     * spans; locations of different partitions are then different memory. Since locations only
+     * overlap when they are equal, a graph must give every access to a field a partition, or
+     * none.
+     */
+    public Object getPartition() {
+        return partition;
     }
 
     @Override
@@ -57,7 +75,7 @@ public class FieldLocationIdentity extends LocationIdentity implements FormatWit
         }
         if (obj instanceof FieldLocationIdentity) {
             FieldLocationIdentity fieldLocationIdentity = (FieldLocationIdentity) obj;
-            return inner.equals(fieldLocationIdentity.inner) && immutable == fieldLocationIdentity.immutable;
+            return inner.equals(fieldLocationIdentity.inner) && immutable == fieldLocationIdentity.immutable && Objects.equals(partition, fieldLocationIdentity.partition);
         }
         return false;
     }
@@ -68,11 +86,11 @@ public class FieldLocationIdentity extends LocationIdentity implements FormatWit
 
     @Override
     public int hashCode() {
-        return Objects.hash(inner, immutable);
+        return partition == null ? Objects.hash(inner, immutable) : Objects.hash(inner, immutable, partition);
     }
 
     @Override
     public String toString() {
-        return inner.format("%H.%n") + (isImmutable() ? ":immutable" : "");
+        return inner.format("%H.%n") + (partition != null ? "@" + partition : "") + (isImmutable() ? ":immutable" : "");
     }
 }

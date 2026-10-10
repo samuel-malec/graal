@@ -70,12 +70,19 @@ public interface MemoryKill extends ValueNodeInterface, MemoryKillMarker {
         return false;
     }
 
+    /**
+     * A node that implements both {@link SingleMemoryKill} and {@link MultiMemoryKill}, such as an
+     * invoke whose kills were narrowed to the locations its callees may write, is a multi kill
+     * while it kills two or more locations, and a single kill otherwise. Code that only knows
+     * single kills sees the conservative {@link SingleMemoryKill#getKilledLocationIdentity()} of
+     * such a node, which is {@link LocationIdentity#any()} for two or more locations.
+     */
     static boolean isSingleMemoryKill(Node n) {
-        return n instanceof SingleMemoryKill;
+        return n instanceof SingleMemoryKill && !(n instanceof MultiMemoryKill multi && multi.getKilledLocationIdentities().length > 1);
     }
 
     static boolean isMultiMemoryKill(Node n) {
-        return n instanceof MultiMemoryKill;
+        return n instanceof MultiMemoryKill multi && (!(n instanceof SingleMemoryKill) || multi.getKilledLocationIdentities().length > 1);
     }
 
     /**
