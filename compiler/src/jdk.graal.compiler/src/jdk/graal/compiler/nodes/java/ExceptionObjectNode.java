@@ -44,6 +44,7 @@ import jdk.graal.compiler.nodes.BeginNode;
 import jdk.graal.compiler.nodes.BeginStateSplitNode;
 import jdk.graal.compiler.nodes.DeoptimizingNode;
 import jdk.graal.compiler.nodes.FixedWithNextNode;
+import jdk.graal.compiler.nodes.Invoke;
 import jdk.graal.compiler.nodes.GraphState;
 import jdk.graal.compiler.nodes.MergeNode;
 import jdk.graal.compiler.nodes.NodeView;
@@ -52,6 +53,7 @@ import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.WithExceptionNode;
 import jdk.graal.compiler.nodes.memory.MemoryAnchorNode;
+import jdk.graal.compiler.nodes.memory.MultiMemoryKill;
 import jdk.graal.compiler.nodes.memory.SingleMemoryKill;
 import jdk.graal.compiler.nodes.spi.Lowerable;
 import jdk.graal.compiler.nodes.spi.LoweringTool;
@@ -63,7 +65,7 @@ import jdk.vm.ci.meta.MetaAccessProvider;
  * throw instruction or implicit exception).
  */
 @NodeInfo(allowedUsageTypes = Memory, cycles = CYCLES_8, size = SIZE_8)
-public final class ExceptionObjectNode extends BeginStateSplitNode implements Lowerable, SingleMemoryKill, DeoptimizingNode.DeoptAfter {
+public final class ExceptionObjectNode extends BeginStateSplitNode implements Lowerable, SingleMemoryKill, MultiMemoryKill, DeoptimizingNode.DeoptAfter {
     public static final NodeClass<ExceptionObjectNode> TYPE = NodeClass.create(ExceptionObjectNode.class);
 
     /**
@@ -71,6 +73,13 @@ public final class ExceptionObjectNode extends BeginStateSplitNode implements Lo
      * a marking scheme to not care about fixed node removal order in lowering.
      */
     private boolean unconditionallyMarkForDeletion;
+
+    /**
+     * What the handler's entry kills, a canonical {@link Invoke#killSet}: by default all of memory,
+     * as the call that threw may have written anything before it did. Narrowed to what the call's
+     * callees may write, when the call is.
+     */
+    private LocationIdentity[] killedLocations = Invoke.KILLS_ANY;
 
     public ExceptionObjectNode(MetaAccessProvider metaAccess) {
         super(TYPE, StampFactory.objectNonNull(TypeReference.createTrustedWithoutAssumptions(metaAccess.lookupJavaType(Throwable.class))));
@@ -82,7 +91,30 @@ public final class ExceptionObjectNode extends BeginStateSplitNode implements Lo
 
     @Override
     public LocationIdentity getKilledLocationIdentity() {
-        return LocationIdentity.any();
+        return Invoke.singleKill(killedLocations);
+    }
+
+    @Override
+    public LocationIdentity[] getKilledLocationIdentities() {
+        return killedLocations;
+    }
+
+    /**
+     * Narrows what the handler's entry kills to the locations the call that threw may write. With
+     * none it is no memory kill at all, with one a single kill, and with two or more a multi kill.
+     */
+    public void setKilledLocationIdentities(LocationIdentity... locations) {
+        this.killedLocations = Invoke.killSet(locations);
+    }
+
+    @Override
+    public boolean killsInit() {
+        for (LocationIdentity location : killedLocations) {
+            if (location.isInit()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

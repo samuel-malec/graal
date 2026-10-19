@@ -2734,6 +2734,7 @@ suite = {
               "exports" : [
                 "com.oracle.graal.pointsto",
                 "com.oracle.graal.pointsto.api",
+                "com.oracle.graal.pointsto.export",
                 "com.oracle.graal.pointsto.heap",
                 "com.oracle.graal.pointsto.heap.value",
                 "com.oracle.graal.pointsto.reports",
