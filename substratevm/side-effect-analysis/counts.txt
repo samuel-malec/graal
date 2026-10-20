@@ -1,0 +1,9 @@
+AcrossCall.demo(Counter, Link)
+    objects    calls 1   writes Counter.value                    reads -
+        AcrossCall.length(Link) kills nothing
+AcrossCall.length(Link)
+    objects    calls 1   writes -                                reads -
+        AcrossCall.length(Link) kills nothing
+AcrossCall.main(String[])
+    objects    calls 1   writes -                                reads -
+        AcrossCall.demo(Counter, Link) kills value

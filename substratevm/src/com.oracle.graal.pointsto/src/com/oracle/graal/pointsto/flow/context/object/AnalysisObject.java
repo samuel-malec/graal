@@ -188,6 +188,21 @@ public class AnalysisObject implements Comparable<AnalysisObject> {
         return arrayElementsTypeStore;
     }
 
+    /**
+     * The field type stores the analysis made for this object's fields, without making any new
+     * one: a field no access reached has none, and holds nothing.
+     */
+    public java.util.List<FieldTypeStore> getExistingInstanceFieldTypeStores() {
+        AtomicReferenceArray<FieldTypeStore> stores = instanceFieldsTypeStore;
+        java.util.List<FieldTypeStore> existing = new java.util.ArrayList<>();
+        for (int i = 0; stores != null && i < stores.length(); i++) {
+            if (stores.get(i) != null) {
+                existing.add(stores.get(i));
+            }
+        }
+        return existing;
+    }
+
     /** Returns the array elements type flow corresponding to an analysis object of array type. */
     public ArrayElementsTypeFlow getArrayElementsFlow(PointsToAnalysis bb, boolean isStore) {
         assert this.isObjectArray() : this;

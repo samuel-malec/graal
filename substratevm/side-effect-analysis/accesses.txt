@@ -1,0 +1,4 @@
+forwarding.AcrossCall.demo(Lforwarding/AcrossCall$Counter;Lforwarding/AcrossCall$Link;)I:11	forwarding.AcrossCall$Counter.value	forwarding.AcrossCall$Counter.value
+forwarding.AcrossCall.demo(Lforwarding/AcrossCall$Counter;Lforwarding/AcrossCall$Link;)I:2	forwarding.AcrossCall$Counter.value	forwarding.AcrossCall$Counter.value
+forwarding.AcrossCall.length(Lforwarding/AcrossCall$Link;)I:10	forwarding.AcrossCall$Link.next	forwarding.AcrossCall$Link.next
+forwarding.AcrossCall.main([Ljava/lang/String;)V:17	forwarding.AcrossCall.sink	forwarding.AcrossCall.sink
