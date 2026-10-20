@@ -69,11 +69,11 @@ import jdk.vm.ci.meta.ResolvedJavaMethod;
  * each access to a field the location of its partition of the objects, and name stores that are
  * dead in Java. A phase at the end of the low tier counts the field stores, field loads and calls
  * left in the program's methods.
- *
+ * <p>
  * Enabled with {@code -H:+SideEffectAnalysis}; the other options are in {@link Options}. With
  * {@code -H:Dump=:1}, the graph is dumped right after the analysis is applied, titled "After
  * applying the side-effect analysis".
- *
+ * <p>
  * Every narrowed call also kills what a safepoint in its callees may change, as Native Image's
  * own safepoints do (the thread's allocation buffer, which a collection resets), and the
  * initialization of what they allocate: Native Image lowers an allocation after the memory graph
@@ -83,55 +83,72 @@ import jdk.vm.ci.meta.ResolvedJavaMethod;
 public final class SideEffectAnalysisFeature implements InternalFeature {
 
     public static final class Options {
-        @Option(help = "Apply a side-effect analysis (the explicit-effects tool) to the compilation: narrow what each call kills, and optionally partition field locations and remove dead stores.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Apply a side-effect analysis (the explicit-effects tool) to the compilation: narrow what each call kills, and optionally partition field locations and remove dead stores.", stability = OptionStability.EXPERIMENTAL)
+//
         public static final HostedOptionKey<Boolean> SideEffectAnalysis = new HostedOptionKey<>(false);
 
-        @Option(help = "The explicit-effects checkout whose tool computes the side effects; it runs with uv.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "The explicit-effects checkout whose tool computes the side effects; it runs with uv.", stability = OptionStability.EXPERIMENTAL)
+//
         public static final HostedOptionKey<String> SideEffectAnalysisTool = new HostedOptionKey<>(".");
 
-        @Option(help = "The uv executable that runs the side-effect tool, as the builder's environment may not find it.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "The uv executable that runs the side-effect tool, as the builder's environment may not find it.", stability = OptionStability.EXPERIMENTAL)
+//
         public static final HostedOptionKey<String> SideEffectAnalysisUv = new HostedOptionKey<>("uv");
 
-        @Option(help = "Directory for the exported points-to results, the tool's answers and the counts of what Graal leaves.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Directory for the exported points-to results, the tool's answers and the counts of what Graal leaves.", stability = OptionStability.EXPERIMENTAL)
+//
         public static final HostedOptionKey<String> SideEffectAnalysisOutput = new HostedOptionKey<>("side-effect-analysis");
 
-        @Option(help = "Comma-separated class-name prefixes of the program whose calls are narrowed and whose accesses are counted. Empty: every class outside the platform's packages.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Comma-separated class-name prefixes of the program whose calls are narrowed and whose accesses are counted. Empty: every class outside the platform's packages.", stability = OptionStability.EXPERIMENTAL)
+//
         public static final HostedOptionKey<String> SideEffectAnalysisProgram = new HostedOptionKey<>("");
 
-        @Option(help = "Narrow what each call kills. Off, the feature only counts what Graal leaves, as a baseline.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Narrow what each call kills. Off, the feature only counts what Graal leaves, as a baseline.", stability = OptionStability.EXPERIMENTAL)
+//
         public static final HostedOptionKey<Boolean> SideEffectAnalysisNarrowCalls = new HostedOptionKey<>(true);
 
-        @Option(help = "How finely memory is partitioned: field keeps Graal's locations; object-field also splits each field by the sets of objects points-to analysis tells apart, which needs -H:AnalysisContextSensitivity=allocsens and -H:+TrackNodeSourcePosition.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "How finely memory is partitioned: field keeps Graal's locations; object-field also splits each field by the sets of objects points-to analysis tells apart, which needs -H:AnalysisContextSensitivity=allocsens and -H:+TrackNodeSourcePosition.", stability = OptionStability.EXPERIMENTAL)
+//
         public static final HostedOptionKey<String> SideEffectAnalysisPartition = new HostedOptionKey<>("field");
 
-        @Option(help = "Also remove the stores the tool's rules find dead in Java (rules.decisions), before Graal compiles.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Also remove the stores the tool's rules find dead in Java (rules.decisions), before Graal compiles.", stability = OptionStability.EXPERIMENTAL)
+//
         public static final HostedOptionKey<Boolean> SideEffectAnalysisRemoveDeadStores = new HostedOptionKey<>(false);
 
-        @Option(help = "Also run Graal's OverwrittenStoreEliminationPhase on the program's methods, right after the analysis is applied, so that its dead stores can be compared with the tool's decisions.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Also run Graal's OverwrittenStoreEliminationPhase on the program's methods, right after the analysis is applied, so that its dead stores can be compared with the tool's decisions.", stability = OptionStability.EXPERIMENTAL)
+//
         public static final HostedOptionKey<Boolean> SideEffectAnalysisEliminateOverwrittenStores = new HostedOptionKey<>(false);
 
-        @Option(help = "Comma-separated method prefixes, as the export names methods: narrow the calls of only these methods.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Comma-separated method prefixes, as the export names methods: narrow the calls of only these methods.", stability = OptionStability.EXPERIMENTAL)
+//
         public static final HostedOptionKey<String> SideEffectAnalysisOnlyMethods = new HostedOptionKey<>("");
 
-        @Option(help = "Comma-separated method prefixes, as the export names methods: narrow the calls of all methods but these.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Comma-separated method prefixes, as the export names methods: narrow the calls of all methods but these.", stability = OptionStability.EXPERIMENTAL)
+//
         public static final HostedOptionKey<String> SideEffectAnalysisSkipMethods = new HostedOptionKey<>("");
 
-        @Option(help = "Have every narrowed call also kill the VM state a safepoint may change. Off is a control that must break images.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Have every narrowed call also kill the VM state a safepoint may change. Off is a control that must break images.", stability = OptionStability.EXPERIMENTAL)
+//
         public static final HostedOptionKey<Boolean> SideEffectAnalysisKillVMState = new HostedOptionKey<>(true);
 
-        @Option(help = "Have narrowed calls kill the platform's fields they write. Off is a control that must break images.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Have narrowed calls kill the platform's fields they write. Off is a control that must break images.", stability = OptionStability.EXPERIMENTAL)
+//
         public static final HostedOptionKey<Boolean> SideEffectAnalysisKillPlatformFields = new HostedOptionKey<>(true);
 
-        @Option(help = "Control: a method, as the export names it, claimed to write nothing, so that a wrong answer shows in the program's output.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Control: a method, as the export names it, claimed to write nothing, so that a wrong answer shows in the program's output.", stability = OptionStability.EXPERIMENTAL)
+//
         public static final HostedOptionKey<String> SideEffectAnalysisClaimWritesNothing = new HostedOptionKey<>("");
 
-        @Option(help = "Control: a method in which different references are claimed never to meet, as an unsound points-to analysis would, so that a wrong partition shows in the output.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Control: a method in which different references are claimed never to meet, as an unsound points-to analysis would, so that a wrong partition shows in the output.", stability = OptionStability.EXPERIMENTAL)
+//
         public static final HostedOptionKey<String> SideEffectAnalysisClaimNoAliasing = new HostedOptionKey<>("");
 
-        @Option(help = "Control: a position, method:bci, whose stores are claimed dead, so that a wrong decision shows in the output.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Control: a position, method:bci, whose stores are claimed dead, so that a wrong decision shows in the output.", stability = OptionStability.EXPERIMENTAL)
+//
         public static final HostedOptionKey<String> SideEffectAnalysisClaimDeadStore = new HostedOptionKey<>("");
 
-        @Option(help = "How the counts name this build. Empty: from the other options (graal, kills, objects or decisions).", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "How the counts name this build. Empty: from the other options (graal, kills, objects or decisions).", stability = OptionStability.EXPERIMENTAL)
+//
         public static final HostedOptionKey<String> SideEffectAnalysisLabel = new HostedOptionKey<>("");
     }
 
@@ -146,19 +163,31 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
     private final List<String> only = prefixes(Options.SideEffectAnalysisOnlyMethods.getValue());
     private final List<String> skip = prefixes(Options.SideEffectAnalysisSkipMethods.getValue());
     private final String label = !Options.SideEffectAnalysisLabel.getValue().isEmpty() ? Options.SideEffectAnalysisLabel.getValue()
-                    : !narrow ? "graal" : decisions ? "decisions" : overwrittenStores ? "graal-dse" : partition.equals("field") ? "kills" : "objects";
+            : !narrow ? "graal" : decisions ? "decisions" : overwrittenStores ? "graal-dse" : partition.equals("field") ? "kills" : "objects";
 
-    /** Method name and descriptor -> the partitions it may write; absent: anything. */
+    /**
+     * Method name and descriptor -> the partitions it may write; absent: anything.
+     */
     private final Map<String, List<String>> written = new HashMap<>();
-    /** Where an access is, a tab, and its field -> its partition. */
+    /**
+     * Where an access is, a tab, and its field -> its partition.
+     */
     private final Map<String, String> located = new HashMap<>();
-    /** Where a store our rules find dead is, a tab, and its field. */
+    /**
+     * Where a store our rules find dead is, a tab, and its field.
+     */
     private final Set<String> dead = new HashSet<>();
-    /** The image's fields by name, to give Graal's locations for the partitions. */
+    /**
+     * The image's fields by name, to give Graal's locations for the partitions.
+     */
     private final Map<String, HostedField> fields = new HashMap<>();
-    /** The VM's state every narrowed call kills: see the class comment. */
+    /**
+     * The VM's state every narrowed call kills: see the class comment.
+     */
     private final List<LocationIdentity> vmState = new ArrayList<>();
-    /** What the low tier leaves of each of the program's methods, and the calls narrowed in it. */
+    /**
+     * What the low tier leaves of each of the program's methods, and the calls narrowed in it.
+     */
     private final Map<String, String> counts = new ConcurrentHashMap<>();
     private final Map<String, List<String>> narrowed = new ConcurrentHashMap<>();
 
@@ -180,7 +209,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
             Files.createDirectories(out);
             PointsToExport.export((PointsToAnalysis) impl.getBigBang(), impl.getUniverse(), "", export.toString(), null, true, "");
             List<String> command = new ArrayList<>(List.of(Options.SideEffectAnalysisUv.getValue(), "run", "--project", Options.SideEffectAnalysisTool.getValue(),
-                            "python", "-m", "effects.kills", export.toString(), "-o", answer.toString(), "--partition", partition));
+                    "python", "-m", "effects.kills", export.toString(), "-o", answer.toString(), "--partition", partition));
             if (!partition.equals("field")) {
                 command.addAll(List.of("--accesses", partitions.toString()));
             }
@@ -203,7 +232,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
             if (decisions) {
                 Path stores = out.resolve("dead.txt");
                 Process rules = new ProcessBuilder(Options.SideEffectAnalysisUv.getValue(), "run", "--project", Options.SideEffectAnalysisTool.getValue(),
-                                "python", "-m", "rules.decisions", export.toString(), "-o", stores.toString(), "--partition", partition).inheritIO().start();
+                        "python", "-m", "rules.decisions", export.toString(), "-o", stores.toString(), "--partition", partition).inheritIO().start();
                 if (rules.waitFor() != 0) {
                     throw new IllegalStateException("rules.decisions failed on " + export);
                 }
@@ -262,10 +291,12 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
             return List.of(); // the image never accesses it, so there is nothing to kill; or the control
         }
         return partitioned.contains(whole) ? List.of(new FieldLocationIdentity(field), new FieldLocationIdentity(field, false, written))
-                        : List.of(new FieldLocationIdentity(field));
+                : List.of(new FieldLocationIdentity(field));
     }
 
-    /** The element kinds of an export's array partition: byte[] stands for boolean[] too. */
+    /**
+     * The element kinds of an export's array partition: byte[] stands for boolean[] too.
+     */
     private static List<JavaKind> arrayKinds(String partition) {
         return switch (partition) {
             case "byte[]" -> List.of(JavaKind.Byte, JavaKind.Boolean);
@@ -344,22 +375,28 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         return java.util.Arrays.stream(commaSeparated.split(",")).filter(prefix -> !prefix.isEmpty()).toList();
     }
 
-    /** Whether the calls in a method are narrowed: the only and skip options limit it. */
+    /**
+     * Whether the calls in a method are narrowed: the only and skip options limit it.
+     */
     private boolean narrowsIn(ResolvedJavaMethod method) {
         String name = key(method);
         return (only.isEmpty() || only.stream().anyMatch(name::startsWith)) && skip.stream().noneMatch(name::startsWith);
     }
 
-    /** As the exporter names a method: Examples.length(LExamples$Link;)I. */
+    /**
+     * As the exporter names a method: Examples.length(LExamples$Link;)I.
+     */
     private static String key(ResolvedJavaMethod method) {
         return method.getDeclaringClass().toJavaName(true) + "." + method.getName() + method.getSignature().toMethodDescriptor();
     }
 
-    /** As graal-probe names a method: Examples.length(Link). */
+    /**
+     * As graal-probe names a method: Examples.length(Link).
+     */
     private static String probeName(ResolvedJavaMethod method) {
         String parameters = java.util.stream.IntStream.range(0, method.getSignature().getParameterCount(false))
-                        .mapToObj(i -> simple(method.getSignature().getParameterType(i, null).toJavaName(true)))
-                        .collect(Collectors.joining(", "));
+                .mapToObj(i -> simple(method.getSignature().getParameterType(i, null).toJavaName(true)))
+                .collect(Collectors.joining(", "));
         return method.getDeclaringClass().toJavaName(false) + "." + method.getName() + "(" + parameters + ")";
     }
 
@@ -367,7 +404,9 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         return name.substring(Math.max(name.lastIndexOf('.'), name.lastIndexOf('$')) + 1);
     }
 
-    /** What a call may write: the kills of every method it may call, null for anything. */
+    /**
+     * What a call may write: the kills of every method it may call, null for anything.
+     */
     private LocationIdentity[] killsOf(MethodCallTargetNode target, Set<String> partitioned) {
         HostedMethod method = (HostedMethod) target.targetMethod();
         HostedMethod[] callees = target.invokeKind().isDireict() ? new HostedMethod[]{method} : method.getImplementations();
@@ -427,23 +466,22 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
             if (at != null && sitesOf(at).stream().anyMatch(site -> dead.contains(site + "\t" + field) || site.equals(claimed))) {
                 jdk.graal.compiler.nodes.util.GraphUtil.removeFixedWithUnusedInputs(store);
                 report.add(String.format("dead store to %s at bci %d removed", simple(name(store.field()).substring(0, name(store.field()).lastIndexOf('.')))
-                                + name(store.field()).substring(name(store.field()).lastIndexOf('.')), store.getNodeSourcePosition().getBCI()));
+                        + name(store.field()).substring(name(store.field()).lastIndexOf('.')), store.getNodeSourcePosition().getBCI()));
             }
         }
     }
 
-    /** The reference an access goes through, for the split: a parameter, or any other value. */
+    /**
+     * The reference an access goes through, for the split: a parameter, or any other value.
+     */
     @SuppressWarnings("deprecation") // a node's id, only to tell values of this graph apart
     private static String reference(AccessFieldNode access) {
         return jdk.graal.compiler.nodes.util.GraphUtil.unproxify(access.object()) instanceof jdk.graal.compiler.nodes.ParameterNode parameter
-                        ? "param" + parameter.index() : "v" + access.object().getId();
+                ? "param" + parameter.index() : "v" + access.object().getId();
     }
 
     /**
-     * Gives each access to a field the location of its partition, if every access to the field in
-     * the graph has one and they aren't all of one partition; the others keep the field's. An
-     * access inlining copied takes the partition of the most specific site it is named by. Returns
-     * the fields given partitions.
+     * Gives each access to a field the location of its partition
      */
     private Set<String> partition(StructuredGraph graph, List<String> report) {
         boolean split = key(graph.method()).equals(Options.SideEffectAnalysisClaimNoAliasing.getValue());
@@ -509,7 +547,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
                         }
                         LocationIdentity[] set = Invoke.killSet(java.util.Arrays.stream(locations).filter(l -> !l.isInit() && !vmState.contains(l)).toArray(LocationIdentity[]::new));
                         calls.add(String.format("%s kills %s", probeName(target.targetMethod()), set.length == 0 ? "nothing"
-                                        : java.util.Arrays.stream(set).map(l -> simple(l.toString())).collect(Collectors.joining(" "))));
+                                : java.util.Arrays.stream(set).map(l -> simple(l.toString())).collect(Collectors.joining(" "))));
                     }
                 }
             }
@@ -540,7 +578,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
             for (StoreFieldNode store : OverwrittenStoreEliminationPhase.overwrittenStores(graph)) {
                 String field = name(store.field());
                 removed.add(String.format("overwritten store to %s at bci %d removed", simple(field.substring(0, field.lastIndexOf('.'))) + field.substring(field.lastIndexOf('.')),
-                                store.getNodeSourcePosition() != null ? store.getNodeSourcePosition().getBCI() : -1));
+                        store.getNodeSourcePosition() != null ? store.getNodeSourcePosition().getBCI() : -1));
                 jdk.graal.compiler.nodes.util.GraphUtil.removeFixedWithUnusedInputs(store);
             }
             if (!removed.isEmpty()) {
@@ -605,7 +643,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
                     boolean loop = block != null && block.getLoop() != null;
                     String where = simple(field.getField().format("%H")) + "." + field.getField().getName() + (loop ? "(loop)" : "");
                     Map<String, Integer> counted = node instanceof StoreFieldNode || node instanceof AbstractWriteNode ? writes
-                                    : node instanceof LoadFieldNode || node instanceof ReadNode || node instanceof FloatingReadNode ? reads : null;
+                            : node instanceof LoadFieldNode || node instanceof ReadNode || node instanceof FloatingReadNode ? reads : null;
                     if (counted != null) {
                         counted.merge(where, 1, Integer::sum);
                     }
@@ -616,7 +654,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
 
         private static String show(Map<String, Integer> counted) {
             return counted.isEmpty() ? "-"
-                            : counted.entrySet().stream().map(e -> e.getKey() + (e.getValue() > 1 ? "×" + e.getValue() : "")).collect(Collectors.joining(" "));
+                    : counted.entrySet().stream().map(e -> e.getKey() + (e.getValue() > 1 ? "×" + e.getValue() : "")).collect(Collectors.joining(" "));
         }
     }
 }
