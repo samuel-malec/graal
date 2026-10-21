@@ -409,7 +409,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
      */
     private LocationIdentity[] killsOf(MethodCallTargetNode target, Set<String> partitioned) {
         HostedMethod method = (HostedMethod) target.targetMethod();
-        HostedMethod[] callees = target.invokeKind().isDireict() ? new HostedMethod[]{method} : method.getImplementations();
+        HostedMethod[] callees = target.invokeKind().isDirect() ? new HostedMethod[]{method} : method.getImplementations();
         if (callees.length == 0) {
             return null;
         }
