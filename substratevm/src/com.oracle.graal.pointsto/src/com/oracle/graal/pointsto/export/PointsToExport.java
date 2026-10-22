@@ -79,17 +79,33 @@ public final class PointsToExport {
                     "org.ietf.", "org.jcp.", "org.w3c.", "org.xml.",
     };
 
-    /** The program's class-name prefix: empty for every class outside the platform's packages, * for all. */
+    /** The program's class-name prefixes, as {@link #isProgramClass(String, String)} takes them. */
     private static volatile String programPrefix = "";
 
     /** Whether a class belongs to the program under analysis, as the last export was told. */
     public static boolean isProgramClass(String className) {
-        String filter = programPrefix;
-        if (filter.equals("*")) {
+        return isProgramClass(className, programPrefix);
+    }
+
+    /**
+     * Whether a class belongs to the program that {@code prefixes} names: comma-separated
+     * class-name prefixes, none for every class outside the platform's packages, * for all.
+     */
+    public static boolean isProgramClass(String className, String prefixes) {
+        if (prefixes.equals("*")) {
             return true;
         }
-        if (!filter.isEmpty()) {
-            return className.startsWith(filter);
+        boolean named = false;
+        for (String prefix : prefixes.split(",")) {
+            if (!prefix.isEmpty()) {
+                named = true;
+                if (className.startsWith(prefix)) {
+                    return true;
+                }
+            }
+        }
+        if (named) {
+            return false;
         }
         for (String prefix : PLATFORM) {
             if (className.startsWith(prefix)) {
@@ -104,8 +120,8 @@ public final class PointsToExport {
      * analysis that has run: the standalone analyzer's, or Native Image's own, from a feature.
      * An empty path skips that file; the reports go to {@code report}, null for none.
      * {@code compiled} says the graphs are about to be compiled into an image, so calls the
-     * analysis found no target for never happen; {@code programPrefix} is the program's
-     * class-name prefix, empty for every class outside the platform's packages.
+     * analysis found no target for never happen; {@code programPrefix} names the program, as
+     * {@link #isProgramClass(String, String)} takes it.
      */
     public static void export(PointsToAnalysis bb, AnalysisUniverse universe, String jsonPath, String irPath, PrintStream report, boolean compiled, String programPrefix) {
         PointsToExport.programPrefix = programPrefix;
@@ -565,18 +581,6 @@ public final class PointsToExport {
     }
 
     private static String jsonArray(Set<String> values) {
-        if (values == null || values.isEmpty()) {
-            return "[]";
-        }
-        StringBuilder sb = new StringBuilder("[");
-        boolean first = true;
-        for (String v : values) {
-            if (!first) {
-                sb.append(", ");
-            }
-            first = false;
-            sb.append('"').append(v).append('"');
-        }
-        return sb.append(']').toString();
+        return GraphExport.toJson(values == null ? List.of() : new ArrayList<>(values), 0);
     }
 }

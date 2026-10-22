@@ -101,7 +101,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
 //
         public static final HostedOptionKey<String> SideEffectAnalysisOutput = new HostedOptionKey<>("side-effect-analysis");
 
-        @Option(help = "Comma-separated class-name prefixes of the program whose calls are narrowed and whose accesses are counted. Empty: every class outside the platform's packages.", stability = OptionStability.EXPERIMENTAL)
+        @Option(help = "Comma-separated class-name prefixes of the program whose calls are narrowed and whose accesses are counted, and that the export describes. Empty: every class outside the platform's packages; *: every class.", stability = OptionStability.EXPERIMENTAL)
 //
         public static final HostedOptionKey<String> SideEffectAnalysisProgram = new HostedOptionKey<>("");
 
@@ -155,7 +155,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
     }
 
     private final Path out = Path.of(Options.SideEffectAnalysisOutput.getValue());
-    private final List<String> program = List.of(Options.SideEffectAnalysisProgram.getValue().split(","));
+    private final String program = Options.SideEffectAnalysisProgram.getValue();
     private final boolean narrow = Options.SideEffectAnalysisNarrowCalls.getValue();
     private final String partition = Options.SideEffectAnalysisPartition.getValue();
     private final boolean decisions = Options.SideEffectAnalysisRemoveDeadStores.getValue();
@@ -209,7 +209,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         Path partitions = out.resolve("accesses.txt");
         try {
             Files.createDirectories(out);
-            PointsToExport.export((PointsToAnalysis) impl.getBigBang(), impl.getUniverse(), "", export.toString(), null, true, "");
+            PointsToExport.export((PointsToAnalysis) impl.getBigBang(), impl.getUniverse(), "", export.toString(), null, true, program);
             List<String> command = new ArrayList<>(List.of(Options.SideEffectAnalysisUv.getValue(), "run", "--project", Options.SideEffectAnalysisTool.getValue(),
                     "python", "-m", "effects.kills", export.toString(), "-o", answer.toString(), "--partition", partition));
             if (!partition.equals("field")) {
@@ -288,7 +288,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
             return arrayKinds(whole).stream().map(NamedLocationIdentity::getArrayLocation).toList();
         }
         HostedField field = fields.get(whole);
-        if (field == null || (!platform && !PointsToExport.isProgramClass(field.getDeclaringClass().toJavaName(true)))) {
+        if (field == null || (!platform && !PointsToExport.isProgramClass(field.getDeclaringClass().toJavaName(true), program))) {
             return List.of(); // the image never accesses it, so there is nothing to kill; or the control
         }
         return partitioned.contains(whole) ? List.of(new FieldLocationIdentity(field), new FieldLocationIdentity(field, false, written))
@@ -365,11 +365,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
     }
 
     private boolean inProgram(ResolvedJavaMethod method) {
-        String holder = method.getDeclaringClass().toJavaName(true);
-        if (program.stream().allMatch(String::isEmpty)) {
-            return PointsToExport.isProgramClass(holder);
-        }
-        return program.stream().anyMatch(prefix -> !prefix.isEmpty() && holder.startsWith(prefix));
+        return PointsToExport.isProgramClass(method.getDeclaringClass().toJavaName(true), program);
     }
 
     private static List<String> prefixes(String commaSeparated) {
@@ -403,6 +399,14 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
 
     private static String simple(String name) {
         return name.substring(Math.max(name.lastIndexOf('.'), name.lastIndexOf('$')) + 1);
+    }
+
+    /**
+     * A field as the reports name it: Aliasing$Counter.value is Counter.value.
+     */
+    private static String shortField(String field) {
+        int dot = field.lastIndexOf('.');
+        return simple(field.substring(0, dot)) + field.substring(dot);
     }
 
     /**
@@ -466,8 +470,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
             String field = name(store.field());
             if (at != null && sitesOf(at).stream().anyMatch(site -> dead.contains(site + "\t" + field) || site.equals(claimed))) {
                 jdk.graal.compiler.nodes.util.GraphUtil.removeFixedWithUnusedInputs(store);
-                report.add(String.format("dead store to %s at bci %d removed", simple(name(store.field()).substring(0, name(store.field()).lastIndexOf('.')))
-                        + name(store.field()).substring(name(store.field()).lastIndexOf('.')), store.getNodeSourcePosition().getBCI()));
+                report.add(String.format("dead store to %s at bci %d removed", shortField(field), store.getNodeSourcePosition().getBCI()));
             }
         }
     }
@@ -506,7 +509,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
                 field.getValue().get(i).setLocationIdentity(new FieldLocationIdentity(field.getValue().get(i).field(), false, partitions.get(i)));
             }
             partitioned.add(field.getKey());
-            report.add(String.format("%s in %s", simple(field.getKey().substring(0, field.getKey().lastIndexOf('.'))) + field.getKey().substring(field.getKey().lastIndexOf('.')),
+            report.add(String.format("%s in %s", shortField(field.getKey()),
                             new java.util.TreeSet<>(partitions).stream().map(p -> p.contains("@") ? p.substring(p.indexOf('@')) : p).collect(Collectors.joining(" "))));
         }
         return partitioned;
@@ -577,8 +580,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
             }
             List<String> removed = new ArrayList<>();
             for (StoreFieldNode store : OverwrittenStoreEliminationPhase.overwrittenStores(graph)) {
-                String field = name(store.field());
-                removed.add(String.format("overwritten store to %s at bci %d removed", simple(field.substring(0, field.lastIndexOf('.'))) + field.substring(field.lastIndexOf('.')),
+                removed.add(String.format("overwritten store to %s at bci %d removed", shortField(name(store.field())),
                         store.getNodeSourcePosition() != null ? store.getNodeSourcePosition().getBCI() : -1));
                 jdk.graal.compiler.nodes.util.GraphUtil.removeFixedWithUnusedInputs(store);
             }

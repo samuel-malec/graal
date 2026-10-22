@@ -910,7 +910,9 @@ final class GraphExport {
                 case '"' -> sb.append("\\\"");
                 case '\\' -> sb.append("\\\\");
                 case '\n' -> sb.append("\\n");
-                default -> sb.append(c < 0x20 ? String.format("\\u%04x", (int) c) : String.valueOf(c));
+                // A control character, or half of a surrogate pair, which a string constant may
+                // hold alone and UTF-8 can't encode: escaped, as JSON allows.
+                default -> sb.append(c < 0x20 || Character.isSurrogate(c) ? String.format("\\u%04x", (int) c) : String.valueOf(c));
             }
         }
         sb.append('"');

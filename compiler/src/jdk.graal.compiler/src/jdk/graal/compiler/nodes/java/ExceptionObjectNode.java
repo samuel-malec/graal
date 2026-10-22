@@ -109,12 +109,7 @@ public final class ExceptionObjectNode extends BeginStateSplitNode implements Lo
 
     @Override
     public boolean killsInit() {
-        for (LocationIdentity location : killedLocations) {
-            if (location.isInit()) {
-                return true;
-            }
-        }
-        return false;
+        return MultiMemoryKill.super.killsInit();
     }
 
     /**

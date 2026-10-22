@@ -166,12 +166,7 @@ public final class InvokeNode extends AbstractMemoryCheckpoint implements Invoke
 
     @Override
     public boolean killsInit() {
-        for (LocationIdentity location : killedLocations) {
-            if (location.isInit()) {
-                return true;
-            }
-        }
-        return false;
+        return MultiMemoryKill.super.killsInit();
     }
 
     @Override
