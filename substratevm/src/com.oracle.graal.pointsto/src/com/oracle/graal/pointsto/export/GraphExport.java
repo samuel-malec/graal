@@ -423,13 +423,13 @@ final class GraphExport {
             return found;
         }
 
-        /** The flow's state over every context, null if it saturated in any. */
+        /** The flow's state over every context, null if it saturated in any; a disabled flow, in code the analysis never reached, holds nothing. */
         private TypeState fold(TypeFlow<?> original) {
             if (original.isSaturated()) {
                 return null;
             }
             if (!(method.getTypeFlow() instanceof CallSiteSensitiveMethodTypeFlow sensitive)) {
-                return original.getState();
+                return original.getOutputState(bb);
             }
             TypeState state = TypeState.forEmpty();
             for (MethodFlowsGraph clone : sensitive.getFlows()) {
@@ -437,7 +437,7 @@ final class GraphExport {
                 if (copy.isSaturated()) {
                     return null;
                 }
-                state = TypeState.forUnion(bb, state, copy.getState());
+                state = TypeState.forUnion(bb, state, copy.getOutputState(bb));
             }
             return state;
         }

@@ -162,8 +162,9 @@ final class ThreadEscape {
         return found;
     }
 
+    /** Adds what a flow may hold: nothing for a saturated one, which its caller handles, or a disabled one, in code the analysis never reached. */
     private void collect(TypeFlow<?> flow, Set<AnalysisObject> into) {
-        TypeState state = flow.isSaturated() ? null : flow.getState();
+        TypeState state = flow.isSaturated() ? null : flow.getOutputState(bb);
         if (state != null && !state.isPrimitive()) {
             for (AnalysisObject object : state.objects(bb)) {
                 into.add(object);

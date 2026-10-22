@@ -75,9 +75,11 @@ import jdk.vm.ci.meta.ResolvedJavaMethod;
  * applying the side-effect analysis".
  * <p>
  * Every narrowed call also kills what a safepoint in its callees may change, as Native Image's
- * own safepoints do (the thread's allocation buffer, which a collection resets), and the
- * initialization of what they allocate: Native Image lowers an allocation after the memory graph
- * is built, so its read of the buffer would otherwise come from before the call.
+ * own safepoints do: the thread's allocation buffer, which a collection resets. Native Image
+ * lowers an allocation after the memory graph is built, so its read of the buffer would otherwise
+ * come from before the call. No call kills init memory: a callee initializes, publishes and fences
+ * what it allocates before it returns ({@code PublishWritesNode}), and Graal takes a kill of init
+ * for an initializing write that a barrier must follow ({@code InitMemoryVerificationPhase}).
  */
 @AutomaticallyRegisteredFeature
 public final class SideEffectAnalysisFeature implements InternalFeature {
@@ -254,14 +256,13 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         for (HostedField field : ((FeatureImpl.BeforeCompilationAccessImpl) access).getUniverse().getFields()) {
             fields.put(name(field), field);
         }
-        // What Native Image's safepoint kills (SafepointSnippets), and initialization.
+        // What Native Image's safepoint kills (SafepointSnippets).
         vmState.addAll(List.of(com.oracle.svm.core.graal.snippets.SubstrateAllocationSnippets.GC_LOCATIONS));
         vmState.add(com.oracle.svm.core.thread.SafepointCheckCounter.getLocationIdentity());
         HostedField sessionState = fields.get("jdk.internal.foreign.MemorySessionImpl.state");
         if (sessionState != null) {
             vmState.add(new FieldLocationIdentity(sessionState));
         }
-        vmState.add(LocationIdentity.init());
     }
 
     private static String name(jdk.vm.ci.meta.ResolvedJavaField field) {
@@ -276,7 +277,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
      */
     private List<LocationIdentity> locations(String written, Set<String> partitioned) {
         if (written.equals("init")) {
-            return vm ? List.of(LocationIdentity.init()) : List.of();
+            return List.of(); // the callee's own initialization: see the class comment
         }
         if (written.startsWith("vm:")) {
             LocationIdentity location = PointsToExport.VM_LOCATIONS.get(written);
@@ -545,7 +546,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
                             // The handler is entered after the callee threw: before it did, it may have written what it writes otherwise.
                             handler.setKilledLocationIdentities(killed.toArray(new LocationIdentity[0]));
                         }
-                        LocationIdentity[] set = Invoke.killSet(java.util.Arrays.stream(locations).filter(l -> !l.isInit() && !vmState.contains(l)).toArray(LocationIdentity[]::new));
+                        LocationIdentity[] set = Invoke.killSet(java.util.Arrays.stream(locations).filter(l -> !vmState.contains(l)).toArray(LocationIdentity[]::new));
                         calls.add(String.format("%s kills %s", probeName(target.targetMethod()), set.length == 0 ? "nothing"
                                 : java.util.Arrays.stream(set).map(l -> simple(l.toString())).collect(Collectors.joining(" "))));
                     }
