@@ -15,6 +15,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.stream.Collectors;
 
 import org.graalvm.word.LocationIdentity;
@@ -68,7 +69,8 @@ import jdk.vm.ci.meta.ResolvedJavaMethod;
  * phases do the rest. The tool can also give
  * each access to a field the location of its partition of the objects, and name stores that are
  * dead in Java. A phase at the end of the low tier counts the field stores, field loads and calls
- * left in the program's methods.
+ * left in the program's methods,
+ * and timings.txt records what each step of the analysis cost in the build.
  * <p>
  * Enabled with {@code -H:+SideEffectAnalysis}; the other options are in {@link Options}. With
  * {@code -H:Dump=:1}, the graph is dumped right after the analysis is applied, titled "After
@@ -97,7 +99,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
 //
         public static final HostedOptionKey<String> SideEffectAnalysisUv = new HostedOptionKey<>("uv");
 
-        @Option(help = "Directory for the exported points-to results, the tool's answers and the counts of what Graal leaves.", stability = OptionStability.EXPERIMENTAL)
+        @Option(help = "Directory for the exported points-to results, the tool's answers, the counts of what Graal leaves and what each step of the analysis cost.", stability = OptionStability.EXPERIMENTAL)
 //
         public static final HostedOptionKey<String> SideEffectAnalysisOutput = new HostedOptionKey<>("side-effect-analysis");
 
@@ -120,6 +122,10 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         @Option(help = "Also run Graal's OverwrittenStoreEliminationPhase on the program's methods, right after the analysis is applied, so that its dead stores can be compared with the tool's decisions.", stability = OptionStability.EXPERIMENTAL)
 //
         public static final HostedOptionKey<Boolean> SideEffectAnalysisEliminateOverwrittenStores = new HostedOptionKey<>(false);
+
+        @Option(help = "Also export the program's graphs, which only the dead-store decisions need, to translate them with the tool afterwards.", stability = OptionStability.EXPERIMENTAL)
+//
+        public static final HostedOptionKey<Boolean> SideEffectAnalysisExportGraphs = new HostedOptionKey<>(false);
 
         @Option(help = "Comma-separated method prefixes, as the export names methods: narrow the calls of only these methods.", stability = OptionStability.EXPERIMENTAL)
 //
@@ -160,6 +166,11 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
     private final String partition = Options.SideEffectAnalysisPartition.getValue();
     private final boolean decisions = Options.SideEffectAnalysisRemoveDeadStores.getValue();
     private final boolean overwrittenStores = Options.SideEffectAnalysisEliminateOverwrittenStores.getValue();
+    /**
+     * Whether the export holds the program's graphs: the decisions translate them; the kill sets
+     * and partitions need only the facts, so writing and reading the graphs is cost they don't need.
+     */
+    private final boolean graphs = decisions || Options.SideEffectAnalysisExportGraphs.getValue();
     private final boolean vm = Options.SideEffectAnalysisKillVMState.getValue();
     private final boolean platform = Options.SideEffectAnalysisKillPlatformFields.getValue();
     private final List<String> only = prefixes(Options.SideEffectAnalysisOnlyMethods.getValue());
@@ -192,6 +203,15 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
      */
     private final Map<String, String> counts = new ConcurrentHashMap<>();
     private final Map<String, List<String>> narrowed = new ConcurrentHashMap<>();
+    /**
+     * What each step of the analysis cost in this build, in nanoseconds, and how often it ran: the
+     * export and the tool once, each phase once per graph, summed over the compiler's threads.
+     * Written to timings.txt, with the size of the export.
+     */
+    private final Map<String, LongAdder> nanos = new ConcurrentHashMap<>();
+    private final Map<String, LongAdder> runs = new ConcurrentHashMap<>();
+    private long exportBytes;
+    private long methodsWithFacts;
 
     @Override
     public boolean isInConfiguration(IsInConfigurationAccess access) {
@@ -209,17 +229,27 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         Path partitions = out.resolve("accesses.txt");
         try {
             Files.createDirectories(out);
-            PointsToExport.export((PointsToAnalysis) impl.getBigBang(), impl.getUniverse(), "", export.toString(), null, true, program);
+            long start = System.nanoTime();
+            PointsToExport.export((PointsToAnalysis) impl.getBigBang(), impl.getUniverse(), graphs ? "" : export.toString(), graphs ? export.toString() : "", null, true, program);
+            time("export", start);
+            PointsToExport.STEP_NANOS.forEach((step, nanos) -> {
+                this.nanos.computeIfAbsent("export: " + step, k -> new LongAdder()).add(nanos);
+                runs.computeIfAbsent("export: " + step, k -> new LongAdder()).increment();
+            });
+            exportBytes = Files.size(export);
             List<String> command = new ArrayList<>(List.of(Options.SideEffectAnalysisUv.getValue(), "run", "--project", Options.SideEffectAnalysisTool.getValue(),
                     "python", "-m", "effects.kills", export.toString(), "-o", answer.toString(), "--partition", partition));
             if (!partition.equals("field")) {
                 command.addAll(List.of("--accesses", partitions.toString()));
             }
+            start = System.nanoTime();
             Process tool = new ProcessBuilder(command).inheritIO().start();
             if (tool.waitFor() != 0) {
                 throw new IllegalStateException("effects.kills failed on " + export);
             }
+            time("effects.kills", start);
             for (String line : Files.readAllLines(answer)) {
+                methodsWithFacts++;
                 String[] parts = line.split("\t", -1);
                 if (!parts[1].equals("any")) {
                     written.put(parts[0], parts[1].isEmpty() ? List.of() : List.of(parts[1].split(",")));
@@ -233,11 +263,13 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
             }
             if (decisions) {
                 Path stores = out.resolve("dead.txt");
+                start = System.nanoTime();
                 Process rules = new ProcessBuilder(Options.SideEffectAnalysisUv.getValue(), "run", "--project", Options.SideEffectAnalysisTool.getValue(),
                         "python", "-m", "rules.decisions", export.toString(), "-o", stores.toString(), "--partition", partition).inheritIO().start();
                 if (rules.waitFor() != 0) {
                     throw new IllegalStateException("rules.decisions failed on " + export);
                 }
+                time("rules.decisions", start);
                 dead.addAll(Files.readAllLines(stores));
             }
         } catch (IOException e) {
@@ -347,6 +379,14 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         }
     }
 
+    /**
+     * Adds the time since {@code start} to a step of the analysis.
+     */
+    private void time(String step, long start) {
+        nanos.computeIfAbsent(step, k -> new LongAdder()).add(System.nanoTime() - start);
+        runs.computeIfAbsent(step, k -> new LongAdder()).increment();
+    }
+
     @Override
     public void afterCompilation(AfterCompilationAccess access) {
         StringBuilder text = new StringBuilder();
@@ -359,6 +399,12 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         try {
             Files.createDirectories(out);
             Files.writeString(out.resolve("counts.txt"), text);
+            StringBuilder timings = new StringBuilder("# step\tseconds\truns (the export and the tool once, a phase once per graph, summed over the compiler's threads)\n");
+            for (Map.Entry<String, LongAdder> step : new TreeMap<>(nanos).entrySet()) {
+                timings.append(String.format(java.util.Locale.ROOT, "%s\t%.3f\t%d%n", step.getKey(), step.getValue().sum() / 1e9, runs.get(step.getKey()).sum()));
+            }
+            timings.append(String.format("# export.json: %d bytes, %d methods with facts%n", exportBytes, methodsWithFacts));
+            Files.writeString(out.resolve("timings.txt"), timings);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
@@ -516,19 +562,47 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
     }
 
     /**
-     * Applies the analysis to one of the program's methods, right after Native Image's inliners:
-     * removes the stores found dead, gives accesses their partitions, and narrows each call, and the
-     * entry of its exception handler, to what its callees may write. Inlined code included: a call's kill set belongs to its targets, not
-     * to where the call is.
+     * A phase of this feature: it applies to every graph, and the time it takes is added to its step
+     * in timings.txt.
      */
-    private final class ApplySideEffectAnalysisPhase extends Phase {
+    private abstract class TimedPhase extends Phase {
+        private final String step;
+
+        TimedPhase(String step) {
+            this.step = step;
+        }
+
         @Override
         public Optional<NotApplicable> notApplicableTo(GraphState graphState) {
             return ALWAYS_APPLICABLE;
         }
 
         @Override
-        protected void run(StructuredGraph graph) {
+        protected final void run(StructuredGraph graph) {
+            long start = System.nanoTime();
+            try {
+                runOn(graph);
+            } finally {
+                time(step, start);
+            }
+        }
+
+        protected abstract void runOn(StructuredGraph graph);
+    }
+
+    /**
+     * Applies the analysis to one of the program's methods, right after Native Image's inliners:
+     * removes the stores found dead, gives accesses their partitions, and narrows each call, and the
+     * entry of its exception handler, to what its callees may write. Inlined code included: a call's kill set belongs to its targets, not
+     * to where the call is.
+     */
+    private final class ApplySideEffectAnalysisPhase extends TimedPhase {
+        ApplySideEffectAnalysisPhase() {
+            super("apply");
+        }
+
+        @Override
+        protected void runOn(StructuredGraph graph) {
             if (!inProgram(graph.method())) {
                 return;
             }
@@ -567,14 +641,13 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
      * Runs Graal's {@link OverwrittenStoreEliminationPhase} on one of the program's methods, after
      * the analysis is applied (so with its partitions), and reports each store it removes.
      */
-    private final class EliminateOverwrittenStoresPhase extends Phase {
-        @Override
-        public Optional<NotApplicable> notApplicableTo(GraphState graphState) {
-            return ALWAYS_APPLICABLE;
+    private final class EliminateOverwrittenStoresPhase extends TimedPhase {
+        EliminateOverwrittenStoresPhase() {
+            super("eliminate overwritten stores");
         }
 
         @Override
-        protected void run(StructuredGraph graph) {
+        protected void runOn(StructuredGraph graph) {
             if (!inProgram(graph.method())) {
                 return;
             }
@@ -601,14 +674,13 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
      * a phase that makes a new access after the partitioning could: their locations would not
      * overlap, and nothing would order them.
      */
-    private final class VerifyFieldPartitionsPhase extends Phase {
-        @Override
-        public Optional<NotApplicable> notApplicableTo(GraphState graphState) {
-            return ALWAYS_APPLICABLE;
+    private final class VerifyFieldPartitionsPhase extends TimedPhase {
+        VerifyFieldPartitionsPhase() {
+            super("verify partitions");
         }
 
         @Override
-        protected void run(StructuredGraph graph) {
+        protected void runOn(StructuredGraph graph) {
             Map<jdk.vm.ci.meta.ResolvedJavaField, Set<Boolean>> kinds = new HashMap<>();
             for (Node node : graph.getNodes()) {
                 if (node instanceof MemoryAccess access && access.getLocationIdentity() instanceof FieldLocationIdentity field && !field.isImmutable()) {
@@ -623,14 +695,13 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         }
     }
 
-    private final class CountFieldAccessesPhase extends Phase {
-        @Override
-        public Optional<NotApplicable> notApplicableTo(GraphState graphState) {
-            return ALWAYS_APPLICABLE;
+    private final class CountFieldAccessesPhase extends TimedPhase {
+        CountFieldAccessesPhase() {
+            super("count accesses (measurement only)");
         }
 
         @Override
-        protected void run(StructuredGraph graph) {
+        protected void runOn(StructuredGraph graph) {
             if (!inProgram(graph.method())) {
                 return;
             }
