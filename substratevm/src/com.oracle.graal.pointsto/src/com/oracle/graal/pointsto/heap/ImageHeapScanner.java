@@ -107,6 +107,11 @@ public abstract class ImageHeapScanner {
     /** Used when creating a constant for immutable-object registration. */
     public static final ScanReason IMMUTABLE_REGISTRATION = new OtherReason("Constant created for immutable-object registration.");
 
+    /** The snapshot of the image heap: every object found reachable in it, by type. */
+    public ImageHeap getImageHeap() {
+        return imageHeap;
+    }
+
     public ImageHeapScanner(BigBang bb, ImageHeap heap, AnalysisMetaAccess aMetaAccess, SnippetReflectionProvider aSnippetReflection,
                     ConstantReflectionProvider aConstantReflection, ObjectScanningObserver aScanningObserver, HostedValuesProvider aHostedValuesProvider) {
         this.bb = bb;

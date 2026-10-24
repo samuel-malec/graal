@@ -489,10 +489,21 @@ public abstract class PointsToAnalysis extends AbstractAnalysisEngine {
 
     }
 
+    /**
+     * The parameter flows that the declared types of the parameters of root methods are injected
+     * into, as the callers of a root method are not known: any object of the type may be passed.
+     */
+    private final java.util.Set<TypeFlow<?>> rootParameterFlows = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    public java.util.Set<TypeFlow<?>> getRootParameterFlows() {
+        return rootParameterFlows;
+    }
+
     private void processParam(AnalysisType declaredParamType, TypeFlow<?> actualParameterFlow) {
         if (actualParameterFlow != null && isSupportedJavaKind(declaredParamType.getStorageKind())) {
             if (declaredParamType.getStorageKind() == JavaKind.Object) {
                 TypeFlow<?> initialParameterFlow = declaredParamType.getTypeFlow(this, true);
+                rootParameterFlows.add(actualParameterFlow);
                 initialParameterFlow.addUse(this, actualParameterFlow);
             } else {
                 actualParameterFlow.addState(this, TypeState.anyPrimitiveState());

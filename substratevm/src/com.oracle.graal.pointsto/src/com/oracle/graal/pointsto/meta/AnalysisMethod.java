@@ -700,6 +700,11 @@ public abstract class AnalysisMethod extends AnalysisElement implements WrappedJ
         return AtomicUtils.isSet(this, isDirectRootMethodUpdater);
     }
 
+    /** Why the method was registered as a root, if it was: what the registration was given. */
+    public Object getRootReason() {
+        return isDirectRootMethod != null ? isDirectRootMethod : isVirtualRootMethod;
+    }
+
     public boolean isSimplyInvoked() {
         return AtomicUtils.isSet(this, isInvokedUpdater);
     }

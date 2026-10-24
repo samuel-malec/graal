@@ -78,6 +78,11 @@ public abstract class OffsetStoreTypeFlow extends TypeFlow<BytecodePosition> {
         return objectFlow;
     }
 
+    /** The flow of the stored value. */
+    public TypeFlow<?> valueFlow() {
+        return valueFlow;
+    }
+
     @Override
     public abstract TypeFlow<BytecodePosition> copy(PointsToAnalysis bb, MethodFlowsGraph methodFlows);
 

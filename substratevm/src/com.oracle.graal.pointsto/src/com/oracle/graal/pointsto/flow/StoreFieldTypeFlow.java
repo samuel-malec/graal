@@ -76,6 +76,11 @@ public abstract class StoreFieldTypeFlow extends AccessFieldTypeFlow {
             this.fieldFlow = original.fieldFlow;
         }
 
+        /** The flow of the stored value. */
+        public TypeFlow<?> valueFlow() {
+            return valueFlow;
+        }
+
         @Override
         public StoreFieldTypeFlow copy(PointsToAnalysis bb, MethodFlowsGraph methodFlows) {
             /* A store to a static field type flow is not context dependent, but it's value is. */
@@ -151,6 +156,11 @@ public abstract class StoreFieldTypeFlow extends AccessFieldTypeFlow {
         @Override
         public TypeFlow<?> receiver() {
             return objectFlow;
+        }
+
+        /** The flow of the stored value, null for the context insensitive store of a field. */
+        public TypeFlow<?> valueFlow() {
+            return valueFlow;
         }
 
         @Override

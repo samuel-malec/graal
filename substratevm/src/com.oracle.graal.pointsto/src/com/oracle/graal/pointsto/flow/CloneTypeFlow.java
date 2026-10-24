@@ -55,6 +55,11 @@ public class CloneTypeFlow extends TypeFlow<BytecodePosition> {
         this.input = methodFlows.lookupCloneOf(bb, original.input);
     }
 
+    /** The flow of the objects this flow clones. */
+    public TypeFlow<?> input() {
+        return input;
+    }
+
     @Override
     public TypeFlow<BytecodePosition> copy(PointsToAnalysis bb, MethodFlowsGraph methodFlows) {
         AnalysisContext allocContext = bb.analysisPolicy().allocationContext(bb, methodFlows);
