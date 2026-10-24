@@ -52,7 +52,7 @@ public abstract class AccessFieldNode extends FixedWithNextNode implements Lower
     @OptionalInput ValueNode object;
     protected FieldLocationIdentity location;
     protected final ResolvedJavaField field;
-    protected final MemoryOrderMode memoryOrder;
+    protected MemoryOrderMode memoryOrder;
 
     public ValueNode object() {
         return object;
@@ -130,6 +130,14 @@ public abstract class AccessFieldNode extends FixedWithNextNode implements Lower
     @Override
     public MemoryOrderMode getMemoryOrder() {
         return memoryOrder;
+    }
+
+    /**
+     * Makes this an ordinary access, whatever the field's modifier says: a volatile field that only
+     * one thread reaches orders this thread with no other. Only before the graph is lowered.
+     */
+    public void makePlain() {
+        this.memoryOrder = MemoryOrderMode.PLAIN;
     }
 
     @Override

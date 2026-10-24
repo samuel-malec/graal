@@ -15,6 +15,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.stream.Collectors;
 
@@ -41,9 +42,13 @@ import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.cfg.ControlFlowGraph;
 import jdk.graal.compiler.nodes.cfg.HIRBlock;
 import jdk.graal.compiler.nodes.java.AccessFieldNode;
+import jdk.graal.compiler.nodes.java.AccessMonitorNode;
 import jdk.graal.compiler.nodes.java.ExceptionObjectNode;
 import jdk.graal.compiler.nodes.java.LoadFieldNode;
 import jdk.graal.compiler.nodes.java.MethodCallTargetNode;
+import jdk.graal.compiler.nodes.java.MonitorEnterNode;
+import jdk.graal.compiler.nodes.java.MonitorExitNode;
+import jdk.graal.compiler.nodes.java.MonitorIdNode;
 import jdk.graal.compiler.nodes.java.StoreFieldNode;
 import jdk.graal.compiler.nodes.memory.AbstractWriteNode;
 import jdk.graal.compiler.nodes.memory.FloatingReadNode;
@@ -155,6 +160,18 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
 //
         public static final HostedOptionKey<String> SideEffectAnalysisClaimDeadStore = new HostedOptionKey<>("");
 
+        @Option(help = "Comma-separated assumptions thread escape makes on top of what the points-to analysis shows: thread-confined (the object a thread parks on and its thread locals are read only by it), vm-fields (the virtual machine's own state is read only by it), vm-code (the virtual machine's code stores references only where it reads them), handler-references (the reference handler thread never reads a referent), entry-points (the callers of the roots outside the analysed code pass only shared objects and keep nothing the roots return). Empty: none. The analysis must track the inputs of its flows (-H:+TrackInputFlows) for the last to matter.", stability = OptionStability.EXPERIMENTAL)
+//
+        public static final HostedOptionKey<String> SideEffectAnalysisAssumptions = new HostedOptionKey<>("");
+
+        @Option(help = "Remove the monitor enters and exits on objects that only one thread reaches and nothing waits or notifies on, as the tool decides (effects.elide). Needs -H:+TrackNodeSourcePosition, and thread escape assumptions to find any.", stability = OptionStability.EXPERIMENTAL)
+//
+        public static final HostedOptionKey<Boolean> SideEffectAnalysisElideLocks = new HostedOptionKey<>(false);
+
+        @Option(help = "Control: a method, as the export names it, whose monitors and volatile accesses are claimed to be on objects only one thread reaches, so that they are removed or made ordinary whatever the tool says; a program that shares them must then go wrong.", stability = OptionStability.EXPERIMENTAL)
+//
+        public static final HostedOptionKey<String> SideEffectAnalysisClaimLocksLocal = new HostedOptionKey<>("");
+
         @Option(help = "How the counts name this build. Empty: from the other options (graal, kills, objects or decisions).", stability = OptionStability.EXPERIMENTAL)
 //
         public static final HostedOptionKey<String> SideEffectAnalysisLabel = new HostedOptionKey<>("");
@@ -171,6 +188,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
      * and partitions need only the facts, so writing and reading the graphs is cost they don't need.
      */
     private final boolean graphs = decisions || Options.SideEffectAnalysisExportGraphs.getValue();
+    private final boolean elideLocks = Options.SideEffectAnalysisElideLocks.getValue();
     private final boolean vm = Options.SideEffectAnalysisKillVMState.getValue();
     private final boolean platform = Options.SideEffectAnalysisKillPlatformFields.getValue();
     private final List<String> only = prefixes(Options.SideEffectAnalysisOnlyMethods.getValue());
@@ -190,6 +208,13 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
      * Where a store our rules find dead is, a tab, and its field.
      */
     private final Set<String> dead = new HashSet<>();
+    /**
+     * Where a monitor the tool says can go is, a tab, and enter or exit.
+     */
+    private final Map<String, String> elide = new HashMap<>();
+    private final AtomicInteger monitorsRemoved = new AtomicInteger();
+    private final AtomicInteger locksRemoved = new AtomicInteger();
+    private final AtomicInteger volatilesMadePlain = new AtomicInteger();
     /**
      * The image's fields by name, to give Graal's locations for the partitions.
      */
@@ -220,7 +245,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
 
     @Override
     public void afterAnalysis(AfterAnalysisAccess access) {
-        if (!narrow) {
+        if (!narrow && !elideLocks) {
             return;
         }
         FeatureImpl.AfterAnalysisAccessImpl impl = (FeatureImpl.AfterAnalysisAccessImpl) access;
@@ -230,6 +255,10 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         try {
             Files.createDirectories(out);
             long start = System.nanoTime();
+            String assumptions = Options.SideEffectAnalysisAssumptions.getValue();
+            if (!assumptions.isEmpty()) {
+                PointsToExport.ASSUMPTIONS = Set.of(assumptions.split(","));
+            }
             PointsToExport.export((PointsToAnalysis) impl.getBigBang(), impl.getUniverse(), graphs ? "" : export.toString(), graphs ? export.toString() : "", null, true, program);
             time("export", start);
             PointsToExport.STEP_NANOS.forEach((step, nanos) -> {
@@ -237,6 +266,23 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
                 runs.computeIfAbsent("export: " + step, k -> new LongAdder()).increment();
             });
             exportBytes = Files.size(export);
+            if (elideLocks) {
+                Path monitors = out.resolve("locks.txt");
+                start = System.nanoTime();
+                Process locks = new ProcessBuilder(Options.SideEffectAnalysisUv.getValue(), "run", "--project", Options.SideEffectAnalysisTool.getValue(),
+                        "python", "-m", "effects.elide", export.toString(), "-o", monitors.toString()).inheritIO().start();
+                if (locks.waitFor() != 0) {
+                    throw new IllegalStateException("effects.elide failed on " + export);
+                }
+                time("effects.elide", start);
+                for (String line : Files.readAllLines(monitors)) {
+                    String[] parts = line.split("\t", 2);
+                    elide.put(parts[0], parts[1]);
+                }
+            }
+            if (!narrow) {
+                return;
+            }
             List<String> command = new ArrayList<>(List.of(Options.SideEffectAnalysisUv.getValue(), "run", "--project", Options.SideEffectAnalysisTool.getValue(),
                     "python", "-m", "effects.kills", export.toString(), "-o", answer.toString(), "--partition", partition));
             if (!partition.equals("field")) {
@@ -353,23 +399,28 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
     @Override
     public void registerGraalPhases(Providers providers, Suites suites, boolean hosted, boolean fallback) {
         if (hosted) {
-            if (narrow) {
+            if (narrow || elideLocks) {
                 /*
                  * After Native Image's inliners, where it puts RemoveUnwindPhase, so that the calls
                  * and stores that inlining brings into a method get the analysis too. Before them
                  * only canonicalization runs, which no kill set changes.
                  */
+                List<Phase> phases = new ArrayList<>();
+                if (narrow) {
+                    phases.add(new ApplySideEffectAnalysisPhase());
+                    if (overwrittenStores) {
+                        phases.add(new EliminateOverwrittenStoresPhase());
+                    }
+                }
+                if (elideLocks) {
+                    phases.add(new ElideLocksPhase());
+                }
                 ListIterator<BasePhase<? super HighTierContext>> afterInlining = suites.getHighTier().findPhase(RemoveUnwindPhase.class);
                 if (afterInlining != null) {
-                    afterInlining.add(new ApplySideEffectAnalysisPhase());
-                    if (overwrittenStores) {
-                        afterInlining.add(new EliminateOverwrittenStoresPhase());
-                    }
+                    phases.forEach(afterInlining::add);
                 } else {
-                    if (overwrittenStores) {
-                        suites.getHighTier().prependPhase(new EliminateOverwrittenStoresPhase());
-                    }
-                    suites.getHighTier().prependPhase(new ApplySideEffectAnalysisPhase());
+                    Collections.reverse(phases);
+                    phases.forEach(suites.getHighTier()::prependPhase);
                 }
             }
             if (!partition.equals("field")) {
@@ -404,6 +455,10 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
                 timings.append(String.format(java.util.Locale.ROOT, "%s\t%.3f\t%d%n", step.getKey(), step.getValue().sum() / 1e9, runs.get(step.getKey()).sum()));
             }
             timings.append(String.format("# export.json: %d bytes, %d methods with facts%n", exportBytes, methodsWithFacts));
+            if (elideLocks) {
+                timings.append(String.format("# locks removed: %d, with %d monitor enters and exits; volatile accesses made ordinary: %d; of %d sites the tool listed%n", locksRemoved.get(), monitorsRemoved.get(),
+                            volatilesMadePlain.get(), elide.size()));
+            }
             Files.writeString(out.resolve("timings.txt"), timings);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
@@ -634,6 +689,80 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
                 narrowed.put(probeName(graph.method()), calls);
             }
             graph.getDebug().dump(DebugContext.BASIC_LEVEL, graph, "After applying the side-effect analysis");
+        }
+    }
+
+    /**
+     * Removes the monitor enters and exits the tool says are on objects only one thread reaches, in
+     * every method, inlined code included. A lock goes whole or not at all: its enter and every
+     * exit, the ones on the paths that throw too, must all be listed, or the frame states and the
+     * monitors left would not match. Positions need -H:+TrackNodeSourcePosition.
+     */
+    private final class ElideLocksPhase extends TimedPhase {
+        ElideLocksPhase() {
+            super("elide locks");
+        }
+
+        @Override
+        protected void runOn(StructuredGraph graph) {
+            List<String> removed = new ArrayList<>();
+            makeVolatilesPlain(graph, removed);
+            List<AccessMonitorNode> monitors = graph.getNodes().filter(AccessMonitorNode.class).snapshot();
+            Map<MonitorIdNode, List<AccessMonitorNode>> locks = new HashMap<>();
+            for (AccessMonitorNode monitor : monitors) {
+                locks.computeIfAbsent(monitor.getMonitorId(), k -> new ArrayList<>()).add(monitor);
+            }
+            for (List<AccessMonitorNode> lock : locks.values()) {
+                if (lock.stream().allMatch(this::listed)) {
+                    for (AccessMonitorNode monitor : lock) {
+                        removed.add(String.format("monitor %s at bci %d removed", monitor instanceof MonitorEnterNode ? "enter" : "exit",
+                                monitor.getNodeSourcePosition() != null ? monitor.getNodeSourcePosition().getBCI() : -1));
+                        jdk.graal.compiler.nodes.util.GraphUtil.removeFixedWithUnusedInputs(monitor);
+                    }
+                    monitorsRemoved.addAndGet(lock.size());
+                    locksRemoved.incrementAndGet();
+                }
+            }
+            if (!removed.isEmpty()) {
+                narrowed.merge(probeName(graph.method()), removed, (calls, more) -> {
+                    List<String> all = new ArrayList<>(calls);
+                    all.addAll(more);
+                    Collections.sort(all);
+                    return all;
+                });
+                graph.getDebug().dump(DebugContext.BASIC_LEVEL, graph, "After eliminating locks");
+            }
+        }
+
+        /** A volatile access of a field the tool says only one thread reaches orders nothing: it becomes an ordinary one. */
+        private void makeVolatilesPlain(StructuredGraph graph, List<String> report) {
+            String claimed = Options.SideEffectAnalysisClaimLocksLocal.getValue();
+            for (AccessFieldNode access : graph.getNodes().filter(AccessFieldNode.class).snapshot()) {
+                if (access.getMemoryOrder() != jdk.graal.compiler.core.common.memory.MemoryOrderMode.VOLATILE) {
+                    continue;
+                }
+                String at = PointsToExport.position(access.getNodeSourcePosition());
+                if (at == null) {
+                    continue;
+                }
+                String decision = (access instanceof LoadFieldNode ? "plain-read" : "plain-write") + "\t" + name(access.field());
+                if (sitesOf(at).stream().anyMatch(site -> decision.equals(elide.get(site)) || !claimed.isEmpty() && site.startsWith(claimed + ":"))) {
+                    access.makePlain();
+                    volatilesMadePlain.incrementAndGet();
+                    report.add(String.format("volatile %s of %s at bci %d made ordinary", access instanceof LoadFieldNode ? "read" : "write", shortField(name(access.field())),
+                            access.getNodeSourcePosition().getBCI()));
+                }
+            }
+        }
+
+        private boolean listed(AccessMonitorNode monitor) {
+            String kind = monitor instanceof MonitorEnterNode && !(monitor instanceof jdk.graal.compiler.nodes.extended.OSRMonitorEnterNode) ? "enter" : monitor instanceof MonitorExitNode ? "exit" : null;
+            String at = PointsToExport.position(monitor.getNodeSourcePosition());
+            if (kind == null || at == null) {
+                return false;
+            }
+            String claimed = Options.SideEffectAnalysisClaimLocksLocal.getValue();
+            return sitesOf(at).stream().anyMatch(site -> kind.equals(elide.get(site)) || !claimed.isEmpty() && site.startsWith(claimed + ":"));
         }
     }
 
