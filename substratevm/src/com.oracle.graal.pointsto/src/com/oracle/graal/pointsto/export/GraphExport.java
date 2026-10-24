@@ -368,6 +368,33 @@ final class GraphExport {
             return access instanceof AccessIndexedNode indexed ? objects(indexed.array()) : null;
         }
 
+        /**
+         * The flows whose states say what a value may be, in the flows graph of the method as it
+         * was before the analysis cloned it for contexts; null if the value comes from something
+         * no flow was made for.
+         */
+        List<TypeFlow<?>> flowsOf(ValueNode reference) {
+            List<TypeFlow<?>> found = new ArrayList<>();
+            Deque<ValueNode> work = new ArrayDeque<>(List.of(reference));
+            Set<ValueNode> seen = new HashSet<>();
+            while (!work.isEmpty()) {
+                ValueNode value = GraphUtil.unproxify(work.pop());
+                if (!seen.add(value) || value.isNullConstant()) {
+                    continue;
+                }
+                if (value instanceof ValuePhiNode phi) {
+                    phi.values().forEach(work::push);
+                    continue;
+                }
+                List<TypeFlow<?>> sources = sources(value);
+                if (sources.isEmpty()) {
+                    return null;
+                }
+                found.addAll(sources);
+            }
+            return found;
+        }
+
         /** Objects corresponding to a given ValueNode, used to obtain an upper-bound of receivers of an access operation */
         List<String> objects(ValueNode reference) {
             TreeSet<String> names = new TreeSet<>();
