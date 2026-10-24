@@ -172,6 +172,7 @@ public final class PointsToExport {
     public static void export(PointsToAnalysis bb, AnalysisUniverse universe, String jsonPath, String irPath, PrintStream report, boolean compiled, String programPrefix) {
         PointsToExport.programPrefix = programPrefix;
         STEP_NANOS.clear();
+        SITE_LABEL_COLLISIONS.set(0);
         long start = System.nanoTime();
         PrintStream out = report != null ? report : new PrintStream(OutputStream.nullOutputStream());
         // Before any name is made: names are keys, and the keys decide the order things are written in.
@@ -184,6 +185,9 @@ public final class PointsToExport {
                         .map(method -> collect(bb, (PointsToAnalysisMethod) method, compiled))
                         .toList()
                         .forEach(found::merge);
+        if (SITE_LABEL_COLLISIONS.get() > 0) {
+            System.err.println("SIDEEFFECT " + SITE_LABEL_COLLISIONS.get() + " locks, volatile accesses or waits had the label of another site in their method; their objects were merged");
+        }
         TreeMap<String, TreeSet<String>> reads = found.reads;
         TreeMap<String, TreeSet<String>> writes = found.writes;
         TreeMap<String, TreeSet<String>> callees = found.callees;
@@ -372,7 +376,7 @@ public final class PointsToExport {
                         String what = "volatile " + (access instanceof LoadFieldNode ? "read of " : "write of ") + field + at;
                         add(access instanceof LoadFieldNode ? f.acquires : f.releases, name, what);
                         synchronizedOn = synchronizedOn != null ? synchronizedOn : new GraphExport.PointsTo(bb, ptm);
-                        f.locks.computeIfAbsent(name, k -> new TreeMap<>()).put(what, synchronizedOn.receivers(access));
+                        putSite(f.locks.computeIfAbsent(name, k -> new TreeMap<>()), what, synchronizedOn.receivers(access));
                     }
                 } else if (n instanceof AccessIndexedNode access) {
                     add(access instanceof LoadIndexedNode ? f.reads : f.writes, name, GraphExport.arrayPartition(access.elementKind()));
@@ -404,7 +408,7 @@ public final class PointsToExport {
                 } else if (n instanceof Invoke invoke) {
                     if (invoke.callTarget() != null && invoke.getTargetMethod() != null && isMonitorQuery(invoke.getTargetMethod()) && !invoke.callTarget().arguments().isEmpty()) {
                         synchronizedOn = synchronizedOn != null ? synchronizedOn : new GraphExport.PointsTo(bb, ptm);
-                        f.waits.computeIfAbsent(name, k -> new TreeMap<>()).put(invoke.getTargetMethod().getName() + at, synchronizedOn.objects(invoke.callTarget().arguments().get(0)));
+                        putSite(f.waits.computeIfAbsent(name, k -> new TreeMap<>()), invoke.getTargetMethod().getName() + at, synchronizedOn.objects(invoke.callTarget().arguments().get(0)));
                     }
                     // No flow, a disabled one or one without callees: the analysis found no target.
                     List<InvokeTypeFlow> found = flows.get(GraphExport.flowKey(invoke));
@@ -432,7 +436,7 @@ public final class PointsToExport {
                     effects(n, name, n.getClass().getSimpleName() + at, f.reads, f.writes, f.allocates, f.vmWrites, f.unknown, f.unknownReads, f.acquires, f.releases);
                     if (n instanceof AccessMonitorNode monitor) {
                         synchronizedOn = synchronizedOn != null ? synchronizedOn : new GraphExport.PointsTo(bb, ptm);
-                        f.locks.computeIfAbsent(name, k -> new TreeMap<>()).put(n.getClass().getSimpleName() + at, synchronizedOn.objects(monitor.object()));
+                        putSite(f.locks.computeIfAbsent(name, k -> new TreeMap<>()), n.getClass().getSimpleName() + at, synchronizedOn.objects(monitor.object()));
                     }
                 }
             }
@@ -459,6 +463,33 @@ public final class PointsToExport {
             }
         }
         return f;
+    }
+
+    /** How many sites had the label of another site of their method, and had their objects merged with it. */
+    private static final java.util.concurrent.atomic.AtomicInteger SITE_LABEL_COLLISIONS = new java.util.concurrent.atomic.AtomicInteger();
+
+    /**
+     * Records the objects a lock, a volatile access or a wait may be on, under its label. The label names
+     * the node's innermost bytecode index only, so two nodes of one graph can have the same one: a
+     * method's own lock and one inlined into it before the analysis, both at index 0. Both are kept, and
+     * the objects are unknown if they are for either, so that a site is judged by everything that shares
+     * its label: a lock on shared objects must not be judged by the thread-local ones next to it.
+     */
+    @SuppressWarnings("unchecked")
+    private static void putSite(TreeMap<String, Object> sites, String label, List<String> receivers) {
+        if (!sites.containsKey(label)) {
+            sites.put(label, receivers);
+            return;
+        }
+        SITE_LABEL_COLLISIONS.incrementAndGet();
+        Object before = sites.get(label);
+        if (before == null || receivers == null) {
+            sites.put(label, null);
+            return;
+        }
+        TreeSet<String> both = new TreeSet<>((List<String>) before);
+        both.addAll(receivers);
+        sites.put(label, new ArrayList<>(both));
     }
 
     /** Whether a call asks about a monitor: waits or notifies on an object, or asks whether the thread holds it. */
