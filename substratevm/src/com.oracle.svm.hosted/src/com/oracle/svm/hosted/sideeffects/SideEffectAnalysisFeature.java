@@ -73,9 +73,8 @@ import jdk.vm.ci.meta.ResolvedJavaMethod;
  * calls, may write. Right after Native Image inlines, every call in the program's methods, the
  * inlined ones included, kills only those locations instead of all of memory, and Graal's own
  * phases do the rest. The tool can also give
- * each access to a field the location of its partition of the objects, and name stores that are
- * dead in Java. A phase at the end of the low tier counts the field stores, field loads and calls
- * left in the program's methods,
+ * each access to a field the location of its partition of the objects. A phase at the end of the
+ * low tier counts the field stores, field loads and calls left in the program's methods,
  * and timings.txt records what each step of the analysis cost in the build.
  * <p>
  * Enabled with {@code -H:+SideEffectAnalysis}; the other options are in {@link Options}. With
@@ -93,7 +92,7 @@ import jdk.vm.ci.meta.ResolvedJavaMethod;
 public final class SideEffectAnalysisFeature implements InternalFeature {
 
     public static final class Options {
-        @Option(help = "Apply a side-effect analysis (the explicit-effects tool) to the compilation: narrow what each call kills, and optionally partition field locations and remove dead stores.", stability = OptionStability.EXPERIMENTAL)
+        @Option(help = "Apply a side-effect analysis (the explicit-effects tool) to the compilation: narrow what each call kills, and optionally partition field locations.", stability = OptionStability.EXPERIMENTAL)
 //
         public static final HostedOptionKey<Boolean> SideEffectAnalysis = new HostedOptionKey<>(false);
 
@@ -121,15 +120,11 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
 //
         public static final HostedOptionKey<String> SideEffectAnalysisPartition = new HostedOptionKey<>("field");
 
-        @Option(help = "Also remove the stores the tool's rules find dead in Java (rules.decisions), before Graal compiles.", stability = OptionStability.EXPERIMENTAL)
-//
-        public static final HostedOptionKey<Boolean> SideEffectAnalysisRemoveDeadStores = new HostedOptionKey<>(false);
-
-        @Option(help = "Also run Graal's OverwrittenStoreEliminationPhase on the program's methods, right after the analysis is applied, so that its dead stores can be compared with the tool's decisions.", stability = OptionStability.EXPERIMENTAL)
+        @Option(help = "Also run Graal's OverwrittenStoreEliminationPhase on the program's methods, right after the analysis is applied: with the partitions, it removes the stores that are overwritten before anything reads them.", stability = OptionStability.EXPERIMENTAL)
 //
         public static final HostedOptionKey<Boolean> SideEffectAnalysisEliminateOverwrittenStores = new HostedOptionKey<>(false);
 
-        @Option(help = "Also export the program's graphs, which only the dead-store decisions need, to translate them with the tool afterwards.", stability = OptionStability.EXPERIMENTAL)
+        @Option(help = "Also export the program's graphs, to translate them with the tool afterwards (graal2ct).", stability = OptionStability.EXPERIMENTAL)
 //
         public static final HostedOptionKey<Boolean> SideEffectAnalysisExportGraphs = new HostedOptionKey<>(false);
 
@@ -157,10 +152,6 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
 //
         public static final HostedOptionKey<String> SideEffectAnalysisClaimNoAliasing = new HostedOptionKey<>("");
 
-        @Option(help = "Control: a position, method:bci, whose stores are claimed dead, so that a wrong decision shows in the output.", stability = OptionStability.EXPERIMENTAL)
-//
-        public static final HostedOptionKey<String> SideEffectAnalysisClaimDeadStore = new HostedOptionKey<>("");
-
         @Option(help = "Comma-separated assumptions thread escape makes on top of what the points-to analysis shows: thread-confined (the object a thread parks on and its thread locals are read only by it), vm-fields (the virtual machine's own state is read only by it), vm-code (the virtual machine's code stores references only where it reads them), handler-references (the reference handler thread never reads a referent), entry-points (the callers of the roots outside the analysed code pass only shared objects and keep nothing the roots return). Empty: none. The analysis must track the inputs of its flows (-H:+TrackInputFlows) for the last to matter.", stability = OptionStability.EXPERIMENTAL)
 //
         public static final HostedOptionKey<String> SideEffectAnalysisAssumptions = new HostedOptionKey<>("");
@@ -177,7 +168,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
 //
         public static final HostedOptionKey<Boolean> SideEffectAnalysisClaimNoDeoptimization = new HostedOptionKey<>(false);
 
-        @Option(help = "How the counts name this build. Empty: from the other options (graal, kills, objects or decisions).", stability = OptionStability.EXPERIMENTAL)
+        @Option(help = "How the counts name this build. Empty: from the other options (graal, kills, objects or graal-dse).", stability = OptionStability.EXPERIMENTAL)
 //
         public static final HostedOptionKey<String> SideEffectAnalysisLabel = new HostedOptionKey<>("");
     }
@@ -186,20 +177,19 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
     private final String program = Options.SideEffectAnalysisProgram.getValue();
     private final boolean narrow = Options.SideEffectAnalysisNarrowCalls.getValue();
     private final String partition = Options.SideEffectAnalysisPartition.getValue();
-    private final boolean decisions = Options.SideEffectAnalysisRemoveDeadStores.getValue();
     private final boolean overwrittenStores = Options.SideEffectAnalysisEliminateOverwrittenStores.getValue();
     /**
-     * Whether the export holds the program's graphs: the decisions translate them; the kill sets
-     * and partitions need only the facts, so writing and reading the graphs is cost they don't need.
+     * Whether the export holds the program's graphs, which the translation (graal2ct) needs; the kill
+     * sets and partitions need only the facts, so writing and reading the graphs is cost they don't need.
      */
-    private final boolean graphs = decisions || Options.SideEffectAnalysisExportGraphs.getValue();
+    private final boolean graphs = Options.SideEffectAnalysisExportGraphs.getValue();
     private final boolean elideLocks = Options.SideEffectAnalysisElideLocks.getValue();
     private final boolean vm = Options.SideEffectAnalysisKillVMState.getValue();
     private final boolean platform = Options.SideEffectAnalysisKillPlatformFields.getValue();
     private final List<String> only = prefixes(Options.SideEffectAnalysisOnlyMethods.getValue());
     private final List<String> skip = prefixes(Options.SideEffectAnalysisSkipMethods.getValue());
     private final String label = !Options.SideEffectAnalysisLabel.getValue().isEmpty() ? Options.SideEffectAnalysisLabel.getValue()
-            : !narrow ? "graal" : decisions ? "decisions" : overwrittenStores ? "graal-dse" : partition.equals("field") ? "kills" : "objects";
+            : !narrow ? "graal" : overwrittenStores ? "graal-dse" : partition.equals("field") ? "kills" : "objects";
 
     /**
      * Method name and descriptor -> the partitions it may write; absent: anything.
@@ -209,10 +199,6 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
      * Where an access is, a tab, and its field -> its partition.
      */
     private final Map<String, String> located = new HashMap<>();
-    /**
-     * Where a store our rules find dead is, a tab, and its field.
-     */
-    private final Set<String> dead = new HashSet<>();
     /**
      * Where a monitor the tool says can go is, a tab, and enter or exit.
      */
@@ -312,17 +298,6 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
                     String[] parts = line.split("\t", -1);
                     located.put(parts[0] + "\t" + parts[1], parts[2]);
                 }
-            }
-            if (decisions) {
-                Path stores = out.resolve("dead.txt");
-                start = System.nanoTime();
-                Process rules = new ProcessBuilder(Options.SideEffectAnalysisUv.getValue(), "run", "--project", Options.SideEffectAnalysisTool.getValue(),
-                        "python", "-m", "rules.decisions", export.toString(), "-o", stores.toString(), "--partition", partition).inheritIO().start();
-                if (rules.waitFor() != 0) {
-                    throw new IllegalStateException("rules.decisions failed on " + export);
-                }
-                time("rules.decisions", start);
-                dead.addAll(Files.readAllLines(stores));
             }
         } catch (IOException e) {
             throw new UncheckedIOException(e);
@@ -548,8 +523,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
      * the same without each outermost caller in turn. A site names a node of the graph the facts
      * were taken from, innermost frame first (m:21 in c:4); inlining a copy of that graph into a
      * caller appends the caller's frame (m:21 in c:4 in h:7). A fact that holds in a graph holds
-     * in every copy of it: a store dead in it is overwritten, on every path inside it, before it
-     * returns or throws, and an access's partition covers every context it is reached in.
+     * in every copy of it: an access's partition covers every context it is reached in.
      */
     private static List<String> sitesOf(String position) {
         List<String> sites = new ArrayList<>();
@@ -561,25 +535,6 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
                 return sites;
             }
             site = site.substring(0, outermost);
-        }
-    }
-
-    /**
-     * Removes the stores the tool's rules find dead, and the ones the control claims are, also in
-     * the copies inlining made of them.
-     */
-    private void removeDeadStores(StructuredGraph graph, List<String> report) {
-        String claimed = Options.SideEffectAnalysisClaimDeadStore.getValue();
-        if (dead.isEmpty() && claimed.isEmpty()) {
-            return;
-        }
-        for (StoreFieldNode store : graph.getNodes().filter(StoreFieldNode.class).snapshot()) {
-            String at = PointsToExport.position(store.getNodeSourcePosition());
-            String field = name(store.field());
-            if (at != null && sitesOf(at).stream().anyMatch(site -> dead.contains(site + "\t" + field) || site.equals(claimed))) {
-                jdk.graal.compiler.nodes.util.GraphUtil.removeFixedWithUnusedInputs(store);
-                report.add(String.format("dead store to %s at bci %d removed", shortField(field), store.getNodeSourcePosition().getBCI()));
-            }
         }
     }
 
@@ -654,7 +609,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
 
     /**
      * Applies the analysis to one of the program's methods, right after Native Image's inliners:
-     * removes the stores found dead, gives accesses their partitions, and narrows each call, and the
+     * gives accesses their partitions, and narrows each call, and the
      * entry of its exception handler, to what its callees may write. Inlined code included: a call's kill set belongs to its targets, not
      * to where the call is.
      */
@@ -669,7 +624,6 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
                 return;
             }
             List<String> calls = new ArrayList<>();
-            removeDeadStores(graph, calls);
             Set<String> partitioned = located.isEmpty() ? Set.of() : partition(graph, calls);
             boolean narrows = narrowsIn(graph.method());
             for (Node node : graph.getNodes()) {
