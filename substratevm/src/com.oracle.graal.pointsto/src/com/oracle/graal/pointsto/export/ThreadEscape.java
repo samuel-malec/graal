@@ -162,7 +162,8 @@ final class ThreadEscape {
 
     /**
      * Controls, which must break the publication examples: the kinds of site to leave out
-     * ({@code -Dsideeffects.controlLeaveOut=static,field,array,copy,handle,opaque}).
+     * ({@code -Dsideeffects.controlLeaveOut=static,field,array,copy,handle,opaque}), {@code imageheap}, which leaves the summaries of the types the image heap
+     * holds out of the roots, and {@code summaries}, which stops a shared summary from sharing every object of its type: to see how much of the answer each decides.
      */
     static final Set<String> LEAVE_OUT = Set.of(System.getProperty("sideeffects.controlLeaveOut", "").split(","));
 
@@ -354,7 +355,7 @@ final class ThreadEscape {
         }
         // The image heap is what every thread reaches, and the snapshot lists its types. The summary of
         // such a type stands for those objects, not for what the program allocates of the type.
-        if (universe.getHeapScanner() != null) {
+        if (universe.getHeapScanner() != null && !LEAVE_OUT.contains("imageheap")) {
             for (Map.Entry<AnalysisType, Set<ImageHeapConstant>> entry : universe.getHeapScanner().getImageHeap().getReachableObjects().entrySet()) {
                 if (!entry.getValue().isEmpty() && !entry.getKey().isPrimitive()) {
                     AnalysisObject summary = entry.getKey().getContextInsensitiveAnalysisObject();
@@ -429,7 +430,7 @@ final class ThreadEscape {
         AnalysisType type = object.type();
         // A summary and the objects it stands for have their contents shared together.
         if (object.isContextInsensitiveObject()) {
-            if (!derivedContents.contains(object)) {
+            if (!derivedContents.contains(object) && !LEAVE_OUT.contains("summaries")) {
                 why.because(() -> "the summary of " + type.toJavaName() + ", whose contents are shared", object);
                 List<AnalysisObject> same = uncontained.remove(type);
                 if (same != null) {
@@ -507,7 +508,7 @@ final class ThreadEscape {
         AnalysisType type = object.type();
         // A summary and the objects it stands for are shared together.
         if (object.isContextInsensitiveObject()) {
-            if (!derivedShared.contains(object)) {
+            if (!derivedShared.contains(object) && !LEAVE_OUT.contains("summaries")) {
                 why.because(() -> "the summary of " + type.toJavaName() + ", which is shared", object);
                 List<AnalysisObject> same = unshared.remove(type);
                 if (same != null) {

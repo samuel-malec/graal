@@ -168,7 +168,18 @@ final class PublishingSites {
             if (store.valueFlow() != null && !escape.isPrivate(store.field()) && !ThreadEscape.LEAVE_OUT.contains("static")) {
                 afterCollection.add(() -> {
                     why.because(() -> "a store into the static field " + store.field().format("%H.%n") + " in " + method.format("%H.%n"), null);
-                    escape.share(reader.held(store.valueFlow(), true));
+                    Held stored = reader.held(store.valueFlow(), true);
+                    if (explain != null && explain.matcher(store.field().format("%H.%n")).find()) {
+                        System.err.println("THREADESCAPE a store into the static field " + store.field().format("%H.%n") + " shares " + why.describe(stored) + " " + why.summary(stored));
+                        for (FlowReader.Source source : stored.stored()) {
+                            if (source.key() instanceof TypeFlow<?> saturated) {
+                                Held rebuilt = reader.rebuild(saturated);
+                                System.err.println("THREADESCAPE   the saturated " + saturated.getClass().getSimpleName() + " of declared type " + saturated.getDeclaredType() + " (filters " + source.filters() + ") is rebuilt as " +
+                                                why.describe(rebuilt) + " " + why.summary(rebuilt));
+                            }
+                        }
+                    }
+                    escape.share(stored);
                 });
                 storeSites++;
             }
