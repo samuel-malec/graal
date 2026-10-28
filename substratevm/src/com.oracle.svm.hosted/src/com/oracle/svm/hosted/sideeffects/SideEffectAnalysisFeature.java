@@ -168,6 +168,10 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
 //
         public static final HostedOptionKey<Boolean> SideEffectAnalysisClaimNoDeoptimization = new HostedOptionKey<>(false);
 
+        @Option(help = "Control, never sound: comma-separated effects whose kill is left out of the kill sets (identity-hash, class-initialization, synchronization, unresolved-calls, calls-without-facts, other-effects; all: every one), to measure the most that precise kill sets could give Graal. The image may be wrong; its output must still be compared with the JVM's.", stability = OptionStability.EXPERIMENTAL)
+//
+        public static final HostedOptionKey<String> SideEffectAnalysisIgnoreEffects = new HostedOptionKey<>("");
+
         @Option(help = "How the counts name this build. Empty: from the other options (graal, kills, objects or graal-dse).", stability = OptionStability.EXPERIMENTAL)
 //
         public static final HostedOptionKey<String> SideEffectAnalysisLabel = new HostedOptionKey<>("");
@@ -184,6 +188,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
      */
     private final boolean graphs = Options.SideEffectAnalysisExportGraphs.getValue();
     private final boolean elideLocks = Options.SideEffectAnalysisElideLocks.getValue();
+    private final String ignoredEffects = Options.SideEffectAnalysisIgnoreEffects.getValue();
     private final boolean vm = Options.SideEffectAnalysisKillVMState.getValue();
     private final boolean platform = Options.SideEffectAnalysisKillPlatformFields.getValue();
     private final List<String> only = prefixes(Options.SideEffectAnalysisOnlyMethods.getValue());
@@ -279,6 +284,9 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
                     "python", "-m", "effects.kills", export.toString(), "-o", answer.toString(), "--partition", partition));
             if (!partition.equals("field")) {
                 command.addAll(List.of("--accesses", partitions.toString()));
+            }
+            if (!ignoredEffects.isEmpty()) {
+                command.addAll(List.of("--ignore", ignoredEffects));
             }
             start = System.nanoTime();
             Process tool = new ProcessBuilder(command).inheritIO().start();
@@ -436,6 +444,9 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
                 timings.append(String.format(java.util.Locale.ROOT, "%s\t%.3f\t%d%n", step.getKey(), step.getValue().sum() / 1e9, runs.get(step.getKey()).sum()));
             }
             timings.append(String.format("# export.json: %d bytes, %d methods with facts%n", exportBytes, methodsWithFacts));
+            if (!ignoredEffects.isEmpty()) {
+                timings.append(String.format("# the kill of %s is left out of the kill sets: an upper bound, not sound%n", ignoredEffects));
+            }
             if (elideLocks) {
                 timings.append(String.format("# locks removed: %d, with %d monitor enters and exits; volatile accesses made ordinary: %d; of %d sites the tool listed%n", locksRemoved.get(), monitorsRemoved.get(),
                             volatilesMadePlain.get(), elide.size()));
