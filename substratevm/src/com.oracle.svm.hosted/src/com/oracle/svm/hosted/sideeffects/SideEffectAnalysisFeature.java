@@ -23,6 +23,7 @@ import org.graalvm.word.LocationIdentity;
 
 import com.oracle.graal.pointsto.PointsToAnalysis;
 import com.oracle.graal.pointsto.export.PointsToExport;
+import com.oracle.svm.core.deopt.DeoptimizationSupport;
 import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.graal.phases.RemoveUnwindPhase;
 import com.oracle.svm.hosted.FeatureImpl;
@@ -164,13 +165,17 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
 //
         public static final HostedOptionKey<String> SideEffectAnalysisAssumptions = new HostedOptionKey<>("");
 
-        @Option(help = "Remove the monitor enters and exits on objects that only one thread reaches and nothing waits or notifies on, as the tool decides (effects.elide). Needs -H:+TrackNodeSourcePosition, and thread escape assumptions to find any.", stability = OptionStability.EXPERIMENTAL)
+        @Option(help = "Remove the monitor enters and exits on objects that only one thread reaches and nothing waits or notifies on, as the tool decides (effects.elide). Needs -H:+TrackNodeSourcePosition, and thread escape assumptions to find any. An image that can deoptimize keeps its monitors.", stability = OptionStability.EXPERIMENTAL)
 //
         public static final HostedOptionKey<Boolean> SideEffectAnalysisElideLocks = new HostedOptionKey<>(false);
 
         @Option(help = "Control: a method, as the export names it, whose monitors and volatile accesses are claimed to be on objects only one thread reaches, so that they are removed or made ordinary whatever the tool says; a program that shares them must then go wrong.", stability = OptionStability.EXPERIMENTAL)
 //
         public static final HostedOptionKey<String> SideEffectAnalysisClaimLocksLocal = new HostedOptionKey<>("");
+
+        @Option(help = "Control: remove the monitors the tool lists in an image that can deoptimize as well, which the image otherwise keeps; code compiled while the program runs and deoptimized inside a locked region must then leave the thread holding the lock.", stability = OptionStability.EXPERIMENTAL)
+//
+        public static final HostedOptionKey<Boolean> SideEffectAnalysisClaimNoDeoptimization = new HostedOptionKey<>(false);
 
         @Option(help = "How the counts name this build. Empty: from the other options (graal, kills, objects or decisions).", stability = OptionStability.EXPERIMENTAL)
 //
@@ -214,6 +219,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
     private final Map<String, String> elide = new HashMap<>();
     private final AtomicInteger monitorsRemoved = new AtomicInteger();
     private final AtomicInteger locksRemoved = new AtomicInteger();
+    private final AtomicInteger locksKeptForDeoptimization = new AtomicInteger();
     private final AtomicInteger volatilesMadePlain = new AtomicInteger();
     /**
      * The image's fields by name, to give Graal's locations for the partitions.
@@ -458,6 +464,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
             if (elideLocks) {
                 timings.append(String.format("# locks removed: %d, with %d monitor enters and exits; volatile accesses made ordinary: %d; of %d sites the tool listed%n", locksRemoved.get(), monitorsRemoved.get(),
                             volatilesMadePlain.get(), elide.size()));
+                timings.append(String.format("# locks kept because the image can deoptimize: %d%n", locksKeptForDeoptimization.get()));
             }
             Files.writeString(out.resolve("timings.txt"), timings);
         } catch (IOException e) {
@@ -697,6 +704,12 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
      * every method, inlined code included. A lock goes whole or not at all: its enter and every
      * exit, the ones on the paths that throw too, must all be listed, or the frame states and the
      * monitors left would not match. Positions need -H:+TrackNodeSourcePosition.
+     *
+     * An image that can deoptimize keeps its monitors. Code compiled while the program runs does
+     * not pass through this phase and takes the locks it finds; when it is deoptimized inside a
+     * locked region, its frame goes on in the version of the method the image was built with, and
+     * that version must release the lock the compiled code took. Without its monitors it would not,
+     * and the thread would hold the lock for good. The volatile accesses are not affected.
      */
     private final class ElideLocksPhase extends TimedPhase {
         ElideLocksPhase() {
@@ -712,8 +725,13 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
             for (AccessMonitorNode monitor : monitors) {
                 locks.computeIfAbsent(monitor.getMonitorId(), k -> new ArrayList<>()).add(monitor);
             }
+            boolean deoptimizes = DeoptimizationSupport.enabled() && !Options.SideEffectAnalysisClaimNoDeoptimization.getValue();
             for (List<AccessMonitorNode> lock : locks.values()) {
                 if (lock.stream().allMatch(this::listed)) {
+                    if (deoptimizes) {
+                        locksKeptForDeoptimization.incrementAndGet();
+                        continue;
+                    }
                     for (AccessMonitorNode monitor : lock) {
                         removed.add(String.format("monitor %s at bci %d removed", monitor instanceof MonitorEnterNode ? "enter" : "exit",
                                 monitor.getNodeSourcePosition() != null ? monitor.getNodeSourcePosition().getBCI() : -1));
