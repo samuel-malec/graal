@@ -266,11 +266,8 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
             if (elideLocks) {
                 Path monitors = out.resolve("locks.txt");
                 start = System.nanoTime();
-                Process locks = new ProcessBuilder(Options.SideEffectAnalysisUv.getValue(), "run", "--project", Options.SideEffectAnalysisTool.getValue(),
-                        "python", "-m", "effects.elide", export.toString(), "-o", monitors.toString()).inheritIO().start();
-                if (locks.waitFor() != 0) {
-                    throw new IllegalStateException("effects.elide failed on " + export);
-                }
+                runTool(new ProcessBuilder(Options.SideEffectAnalysisUv.getValue(), "run", "--project", Options.SideEffectAnalysisTool.getValue(),
+                        "python", "-m", "effects.elide", export.toString(), "-o", monitors.toString()), "effects.elide", export);
                 time("effects.elide", start);
                 for (String line : Files.readAllLines(monitors)) {
                     String[] parts = line.split("\t", 2);
@@ -289,10 +286,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
                 command.addAll(List.of("--ignore", ignoredEffects));
             }
             start = System.nanoTime();
-            Process tool = new ProcessBuilder(command).inheritIO().start();
-            if (tool.waitFor() != 0) {
-                throw new IllegalStateException("effects.kills failed on " + export);
-            }
+            runTool(new ProcessBuilder(command), "effects.kills", export);
             time("effects.kills", start);
             for (String line : Files.readAllLines(answer)) {
                 methodsWithFacts++;
@@ -316,6 +310,35 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         if (!lie.isEmpty()) {
             written.put(lie, List.of());
         }
+    }
+
+    /**
+     * Runs a tool of the analysis to its end and stops it, with the processes it started, when the
+     * image generator ends first: the generator's watchdog aborts a build whose step takes ten
+     * minutes (-H:DeadlockWatchdogInterval), and a tool left running would go on using the
+     * machine's memory.
+     */
+    private static void runTool(ProcessBuilder builder, String name, Path export) throws IOException, InterruptedException {
+        Process tool = builder.inheritIO().start();
+        Thread stop = new Thread(() -> stopTree(tool));
+        Runtime.getRuntime().addShutdownHook(stop);
+        try {
+            if (tool.waitFor() != 0) {
+                throw new IllegalStateException(name + " failed on " + export);
+            }
+        } finally {
+            stopTree(tool);
+            try {
+                Runtime.getRuntime().removeShutdownHook(stop);
+            } catch (IllegalStateException e) {
+                // the generator is already ending: the hook runs
+            }
+        }
+    }
+
+    private static void stopTree(Process tool) {
+        tool.descendants().forEach(ProcessHandle::destroyForcibly);
+        tool.destroyForcibly();
     }
 
     @Override
