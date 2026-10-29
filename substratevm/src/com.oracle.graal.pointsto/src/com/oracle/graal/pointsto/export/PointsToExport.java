@@ -274,8 +274,7 @@ public final class PointsToExport {
         start = step("report", start);
         TreeSet<String> shared = ThreadEscape.sharedObjects(bb, universe, describedAs.apply(analysed, unknown, unresolved), compiled, ASSUMPTIONS, found.unsafeStores, found.opaqueCalls);
         start = step("thread escape", start);
-        String facts = factsJson(analysed, reads, writes, callees, allocates, unknown, acquires, releases, locks, waits, unresolved, accesses, fields, vmWrites, unknownReads, dead)
-                        + ",\n  \"sharedObjects\": " + GraphExport.toJson(new ArrayList<>(shared), 1);
+        StringBuilder sharedJson = new StringBuilder(",\n  \"sharedObjects\": ").append(GraphExport.toJson(new ArrayList<>(shared), 1));
         if (System.getProperty("sideeffects.assumptionLayers") != null) {
             // For evaluation: what each assumption adds, from one analysis.
             TreeMap<String, Object> layers = new TreeMap<>();
@@ -284,10 +283,19 @@ public final class PointsToExport {
                 layers.put(assumptions.isEmpty() ? "none" : assumptions, new ArrayList<>(ThreadEscape.sharedObjects(bb, universe, describedAs.apply(analysed, unknown, unresolved), compiled,
                                 assumptions.isEmpty() ? Set.of() : Set.of(assumptions.split(",")), found.unsafeStores, found.opaqueCalls)));
             }
-            facts += ",\n  \"sharedObjectsByAssumptions\": " + GraphExport.toJson(layers, 1);
+            sharedJson.append(",\n  \"sharedObjectsByAssumptions\": ").append(GraphExport.toJson(layers, 1));
         }
+        // Written method by method: with allocation sites the facts are longer than a String can be (2^31 characters).
+        Content facts = w -> {
+            factsJson(w, analysed, reads, writes, callees, allocates, unknown, acquires, releases, locks, waits, unresolved, accesses, fields, vmWrites, unknownReads, dead);
+            w.append(sharedJson);
+        };
         if (!jsonPath.isEmpty()) {
-            write(jsonPath, "{\n" + facts + "\n}\n");
+            write(jsonPath, w -> {
+                w.write("{\n");
+                facts.writeTo(w);
+                w.write("\n}\n");
+            });
             out.println();
             out.println("wrote " + jsonPath);
         }
@@ -308,7 +316,14 @@ public final class PointsToExport {
                 graphs.add(GraphExport.export(bb, method, objectNames));
             }
             start = step("graphs", start);
-            write(irPath, "{\n" + facts + ",\n  \"graphs\": " + GraphExport.toJson(graphs, 1) + "\n}\n");
+            String graphsJson = GraphExport.toJson(graphs, 1);
+            write(irPath, w -> {
+                w.write("{\n");
+                facts.writeTo(w);
+                w.write(",\n  \"graphs\": ");
+                w.write(graphsJson);
+                w.write("\n}\n");
+            });
             out.println();
             out.println("wrote " + graphs.size() + " graphs to " + irPath);
         }
@@ -559,7 +574,7 @@ public final class PointsToExport {
         }
     }
 
-    private static String factsJson(Set<String> methods,
+    private static void factsJson(java.io.Writer out, Set<String> methods,
                     TreeMap<String, TreeSet<String>> reads,
                     TreeMap<String, TreeSet<String>> writes,
                     TreeMap<String, TreeSet<String>> callees,
@@ -574,19 +589,20 @@ public final class PointsToExport {
                     TreeMap<String, boolean[]> fields,
                     TreeMap<String, TreeSet<String>> vmWrites,
                     TreeMap<String, TreeSet<String>> unknownReads,
-                    TreeMap<String, TreeSet<String>> dead) {
+                    TreeMap<String, TreeSet<String>> dead) throws java.io.IOException {
 
         Set<String> allMethods = new TreeSet<>(methods);
         allMethods.addAll(callees.keySet());
         StringBuilder sb = new StringBuilder();
-        sb.append("  \"methods\": {\n");
+        out.write("  \"methods\": {\n");
         boolean firstMethod = true;
 
         for (String m : allMethods) {
             if (!firstMethod) {
-                sb.append(",\n");
+                out.write(",\n");
             }
             firstMethod = false;
+            sb.setLength(0);
             sb.append("    \"").append(m).append("\": {")
                             .append("\"reads\": ").append(jsonArray(reads.get(m)))
                             .append(", \"writes\": ").append(jsonArray(writes.get(m)))
@@ -609,23 +625,25 @@ public final class PointsToExport {
                 sb.append(", \"waits\": ").append(GraphExport.toJson(waits.get(m), 3));
             }
             sb.append("}");
+            out.append(sb);
         }
 
-        sb.append("\n  },\n  \"fields\": {\n");
+        out.write("\n  },\n  \"fields\": {\n");
         boolean firstField = true;
 
         for (var e : fields.entrySet()) {
             if (!firstField) {
-                sb.append(",\n");
+                out.write(",\n");
             }
             firstField = false;
+            sb.setLength(0);
             sb.append("    \"").append(e.getKey()).append("\": {")
                             .append("\"read\": ").append(e.getValue()[0])
                             .append(", \"written\": ").append(e.getValue()[1])
                             .append("}");
+            out.append(sb);
         }
-        sb.append("\n  }");
-        return sb.toString();
+        out.write("\n  }");
     }
 
     /**
@@ -769,14 +787,24 @@ public final class PointsToExport {
         add(accesses, method, GraphExport.toJson(access, 2));
     }
 
-    private static void write(String path, String content) {
+    /**
+     * Text that is written to a file piece by piece, because a large export is longer than a
+     * String can be.
+     */
+    private interface Content {
+        void writeTo(java.io.Writer out) throws java.io.IOException;
+    }
+
+    private static void write(String path, Content content) {
         try {
             java.nio.file.Path out = java.nio.file.Path.of(path).toAbsolutePath();
             java.nio.file.Path parent = out.getParent();
             if (parent != null) {
                 java.nio.file.Files.createDirectories(parent);
             }
-            java.nio.file.Files.writeString(out, content);
+            try (java.io.Writer writer = java.nio.file.Files.newBufferedWriter(out)) {
+                content.writeTo(writer);
+            }
         } catch (java.io.IOException e) {
             throw new RuntimeException("could not write " + path, e);
         }
