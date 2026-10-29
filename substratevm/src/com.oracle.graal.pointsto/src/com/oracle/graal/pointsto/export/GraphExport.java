@@ -907,6 +907,40 @@ final class GraphExport {
         }
     }
 
+    /**
+     * The JSON that {@link #toJson(Object, int)} gives for a collection of strings, written to
+     * {@code out} one string at a time: the shared objects of a large image are longer than a
+     * String can be (2^31 characters).
+     */
+    static void writeJson(java.io.Writer out, Collection<String> strings) throws java.io.IOException {
+        out.write('[');
+        boolean first = true;
+        for (String s : strings) {
+            if (!first) {
+                out.write(", ");
+            }
+            first = false;
+            quote(out, s);
+        }
+        out.write(']');
+    }
+
+    /** The JSON of {@link #toJson(Object, int)} for a map of collections of strings, written as {@link #writeJson(java.io.Writer, Collection)} does. */
+    static void writeJson(java.io.Writer out, Map<String, ? extends Collection<String>> byName) throws java.io.IOException {
+        out.write('{');
+        boolean first = true;
+        for (Map.Entry<String, ? extends Collection<String>> e : byName.entrySet()) {
+            if (!first) {
+                out.write(", ");
+            }
+            first = false;
+            quote(out, e.getKey());
+            out.write(": ");
+            writeJson(out, e.getValue());
+        }
+        out.write('}');
+    }
+
     private static boolean isScalar(Object value) {
         return !(value instanceof Map<?, ?>) && !(value instanceof List<?>);
     }
@@ -928,6 +962,12 @@ final class GraphExport {
         if (!flat) {
             sb.append('\n').append("  ".repeat(depth));
         }
+    }
+
+    private static void quote(java.io.Writer out, String s) throws java.io.IOException {
+        StringBuilder sb = new StringBuilder(s.length() + 2);
+        quote(sb, s);
+        out.append(sb);
     }
 
     private static void quote(StringBuilder sb, String s) {

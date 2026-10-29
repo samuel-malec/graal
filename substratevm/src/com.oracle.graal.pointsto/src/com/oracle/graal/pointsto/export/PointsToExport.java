@@ -274,21 +274,25 @@ public final class PointsToExport {
         start = step("report", start);
         TreeSet<String> shared = ThreadEscape.sharedObjects(bb, universe, describedAs.apply(analysed, unknown, unresolved), compiled, ASSUMPTIONS, found.unsafeStores, found.opaqueCalls);
         start = step("thread escape", start);
-        StringBuilder sharedJson = new StringBuilder(",\n  \"sharedObjects\": ").append(GraphExport.toJson(new ArrayList<>(shared), 1));
+        // For evaluation: what each assumption adds, from one analysis.
+        Map<String, TreeSet<String>> byAssumptions = new TreeMap<>();
         if (System.getProperty("sideeffects.assumptionLayers") != null) {
-            // For evaluation: what each assumption adds, from one analysis.
-            TreeMap<String, Object> layers = new TreeMap<>();
             for (String assumptions : List.of("", "thread-confined", "thread-confined,vm-fields", "thread-confined,vm-fields,vm-code", "thread-confined,vm-fields,vm-code,handler-references",
                             "thread-confined,vm-fields,vm-code,handler-references,entry-points", "vm-code,entry-points")) {
-                layers.put(assumptions.isEmpty() ? "none" : assumptions, new ArrayList<>(ThreadEscape.sharedObjects(bb, universe, describedAs.apply(analysed, unknown, unresolved), compiled,
-                                assumptions.isEmpty() ? Set.of() : Set.of(assumptions.split(",")), found.unsafeStores, found.opaqueCalls)));
+                byAssumptions.put(assumptions.isEmpty() ? "none" : assumptions, ThreadEscape.sharedObjects(bb, universe, describedAs.apply(analysed, unknown, unresolved), compiled,
+                                assumptions.isEmpty() ? Set.of() : Set.of(assumptions.split(",")), found.unsafeStores, found.opaqueCalls));
             }
-            sharedJson.append(",\n  \"sharedObjectsByAssumptions\": ").append(GraphExport.toJson(layers, 1));
         }
-        // Written method by method: with allocation sites the facts are longer than a String can be (2^31 characters).
+        // Written method by method, and the shared objects one by one: with allocation sites the facts and the shared objects are each longer than
+        // a String can be (2^31 characters).
         Content facts = w -> {
             factsJson(w, analysed, reads, writes, callees, allocates, unknown, acquires, releases, locks, waits, unresolved, accesses, fields, vmWrites, unknownReads, dead);
-            w.append(sharedJson);
+            w.write(",\n  \"sharedObjects\": ");
+            GraphExport.writeJson(w, shared);
+            if (!byAssumptions.isEmpty()) {
+                w.write(",\n  \"sharedObjectsByAssumptions\": ");
+                GraphExport.writeJson(w, byAssumptions);
+            }
         };
         if (!jsonPath.isEmpty()) {
             write(jsonPath, w -> {
