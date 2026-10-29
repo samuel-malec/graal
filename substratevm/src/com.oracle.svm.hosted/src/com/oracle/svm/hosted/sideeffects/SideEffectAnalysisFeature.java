@@ -472,7 +472,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
             }
             if (elideLocks) {
                 timings.append(String.format("# locks removed: %d, with %d monitor enters and exits; volatile accesses made ordinary: %d; of %d sites the tool listed%n", locksRemoved.get(), monitorsRemoved.get(),
-                            volatilesMadePlain.get(), elide.size()));
+                        volatilesMadePlain.get(), elide.size()));
                 timings.append(String.format("# locks kept because the image can deoptimize: %d%n", locksKeptForDeoptimization.get()));
             }
             Files.writeString(out.resolve("timings.txt"), timings);
@@ -596,7 +596,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
             for (AccessFieldNode access : field.getValue()) {
                 String at = PointsToExport.position(access.getNodeSourcePosition());
                 String found = at == null || access.getLocationIdentity().isImmutable() || access.ordersMemoryAccesses() ? null
-                                : sitesOf(at).stream().map(site -> located.get(site + "\t" + field.getKey())).filter(java.util.Objects::nonNull).findFirst().orElse(null);
+                        : sitesOf(at).stream().map(site -> located.get(site + "\t" + field.getKey())).filter(java.util.Objects::nonNull).findFirst().orElse(null);
                 partitions.add(found == null || !split ? found : found + "#" + reference(access));
             }
             if (partitions.contains(null) || partitions.stream().allMatch(field.getKey()::equals)) {
@@ -607,7 +607,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
             }
             partitioned.add(field.getKey());
             report.add(String.format("%s in %s", shortField(field.getKey()),
-                            new java.util.TreeSet<>(partitions).stream().map(p -> p.contains("@") ? p.substring(p.indexOf('@')) : p).collect(Collectors.joining(" "))));
+                    new java.util.TreeSet<>(partitions).stream().map(p -> p.contains("@") ? p.substring(p.indexOf('@')) : p).collect(Collectors.joining(" "))));
         }
         return partitioned;
     }
@@ -692,7 +692,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
      * every method, inlined code included. A lock goes whole or not at all: its enter and every
      * exit, the ones on the paths that throw too, must all be listed, or the frame states and the
      * monitors left would not match. Positions need -H:+TrackNodeSourcePosition.
-     *
+     * <p>
      * An image that can deoptimize keeps its monitors. Code compiled while the program runs does
      * not pass through this phase and takes the locks it finds; when it is deoptimized inside a
      * locked region, its frame goes on in the version of the method the image was built with, and
@@ -740,7 +740,9 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
             }
         }
 
-        /** A volatile access of a field the tool says only one thread reaches orders nothing: it becomes an ordinary one. */
+        /**
+         * A volatile access of a field the tool says only one thread reaches orders nothing: it becomes an ordinary one.
+         */
         private void makeVolatilesPlain(StructuredGraph graph, List<String> report) {
             String claimed = Options.SideEffectAnalysisClaimLocksLocal.getValue();
             for (AccessFieldNode access : graph.getNodes().filter(AccessFieldNode.class).snapshot()) {
