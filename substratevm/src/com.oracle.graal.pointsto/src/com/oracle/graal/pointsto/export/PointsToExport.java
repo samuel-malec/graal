@@ -320,12 +320,12 @@ public final class PointsToExport {
                 graphs.add(GraphExport.export(bb, method, objectNames));
             }
             start = step("graphs", start);
-            String graphsJson = GraphExport.toJson(graphs, 1);
+            // Written graph by graph: the graphs of a framework are longer than a String can be (2^31 characters).
             write(irPath, w -> {
                 w.write("{\n");
                 facts.writeTo(w);
                 w.write(",\n  \"graphs\": ");
-                w.write(graphsJson);
+                GraphExport.writeJson(w, graphs, 1);
                 w.write("\n}\n");
             });
             out.println();

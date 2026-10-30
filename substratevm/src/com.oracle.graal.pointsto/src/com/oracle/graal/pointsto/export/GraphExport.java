@@ -941,6 +941,28 @@ final class GraphExport {
         out.write('}');
     }
 
+    /**
+     * The JSON that {@link #toJson(Object, int)} gives for a list of maps, written to {@code out}
+     * one element at a time: the graphs of a framework are longer than a String can be (2^31
+     * characters).
+     */
+    static void writeJson(java.io.Writer out, List<Map<String, Object>> elements, int depth) throws java.io.IOException {
+        out.write('[');
+        for (int i = 0; i < elements.size(); i++) {
+            if (i > 0) {
+                out.write(',');
+            }
+            out.write('\n');
+            out.write("  ".repeat(depth + 1));
+            out.write(toJson(elements.get(i), depth + 1));
+        }
+        if (!elements.isEmpty()) {
+            out.write('\n');
+            out.write("  ".repeat(depth));
+        }
+        out.write(']');
+    }
+
     private static boolean isScalar(Object value) {
         return !(value instanceof Map<?, ?>) && !(value instanceof List<?>);
     }
