@@ -35,8 +35,12 @@ import com.oracle.svm.shared.option.HostedOptionKey;
 
 import jdk.graal.compiler.debug.DebugContext;
 import jdk.graal.compiler.graph.Node;
+import jdk.graal.compiler.graph.NodeSourcePosition;
+import jdk.graal.compiler.nodes.AbstractDeoptimizeNode;
+import jdk.graal.compiler.nodes.ControlSplitNode;
 import jdk.graal.compiler.nodes.FieldLocationIdentity;
 import jdk.graal.compiler.nodes.GraphState;
+import jdk.graal.compiler.nodes.IfNode;
 import jdk.graal.compiler.nodes.Invoke;
 import jdk.graal.compiler.nodes.InvokeWithExceptionNode;
 import jdk.graal.compiler.nodes.NamedLocationIdentity;
@@ -231,6 +235,12 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
      */
     private final Map<String, String> counts = new ConcurrentHashMap<>();
     private final Map<String, List<String>> narrowed = new ConcurrentHashMap<>();
+    /**
+     * What the low tier leaves of each of the program's methods in control flow (control.txt), and where each field load
+     * and store left in it is, with the inlining it came through and whether it is in a loop (sites.txt).
+     */
+    private final Map<String, String> control = new ConcurrentHashMap<>();
+    private final Map<String, List<String>> sites = new ConcurrentHashMap<>();
     /**
      * What each step of the analysis cost in this build, in nanoseconds, and how often it ran: the
      * export and the tool once, each phase once per graph, summed over the compiler's threads.
@@ -472,6 +482,12 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         try {
             Files.createDirectories(out);
             Files.writeString(out.resolve("counts.txt"), text);
+            StringBuilder flow = new StringBuilder("# method\tblocks\tcontrol-flow edges\tifs\tswitches and other splits\tloops\tcalls with an exception edge\tdeoptimizations\n");
+            new TreeMap<>(control).forEach((method, row) -> flow.append(method).append('\t').append(row).append('\n'));
+            Files.writeString(out.resolve("control.txt"), flow);
+            StringBuilder places = new StringBuilder("# method\tload or store\tin a loop or not\tfield\tinlining it came through, innermost first (- without -H:+TrackNodeSourcePosition)\n");
+            new TreeMap<>(sites).forEach((method, list) -> list.forEach(site -> places.append(method).append('\t').append(site).append('\n')));
+            Files.writeString(out.resolve("sites.txt"), places);
             StringBuilder timings = new StringBuilder("# step\tseconds\truns (the export and the tool once, a phase once per graph, summed over the compiler's threads)\n");
             for (Map.Entry<String, LongAdder> step : new TreeMap<>(nanos).entrySet()) {
                 timings.append(String.format(java.util.Locale.ROOT, "%s\t%.3f\t%d%n", step.getKey(), step.getValue().sum() / 1e9, runs.get(step.getKey()).sum()));
@@ -855,7 +871,12 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
             ControlFlowGraph cfg = ControlFlowGraph.newBuilder(graph).connectBlocks(true).computeLoops(true).build();
             Map<String, Integer> writes = new TreeMap<>();
             Map<String, Integer> reads = new TreeMap<>();
+            List<String> accessSites = new ArrayList<>();
             int calls = 0;
+            int ifs = 0;
+            int otherSplits = 0;
+            int exceptionCalls = 0;
+            int deoptimizations = 0;
             for (Node node : graph.getNodes()) {
                 if (node instanceof Invoke) {
                     calls++;
@@ -863,14 +884,50 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
                     HIRBlock block = cfg.blockFor(node);
                     boolean loop = block != null && block.getLoop() != null;
                     String where = simple(field.getField().format("%H")) + "." + field.getField().getName() + (loop ? "(loop)" : "");
-                    Map<String, Integer> counted = node instanceof StoreFieldNode || node instanceof AbstractWriteNode ? writes
+                    boolean store = node instanceof StoreFieldNode || node instanceof AbstractWriteNode;
+                    Map<String, Integer> counted = store ? writes
                             : node instanceof LoadFieldNode || node instanceof ReadNode || node instanceof FloatingReadNode ? reads : null;
                     if (counted != null) {
                         counted.merge(where, 1, Integer::sum);
+                        accessSites.add(String.join("\t", store ? "store" : "load", loop ? "loop" : "flat", simple(field.getField().format("%H")) + "." + field.getField().getName(), position(node)));
                     }
                 }
+                if (node instanceof InvokeWithExceptionNode) {
+                    exceptionCalls++;
+                } else if (node instanceof IfNode) {
+                    ifs++;
+                } else if (node instanceof ControlSplitNode) {
+                    otherSplits++;
+                } else if (node instanceof AbstractDeoptimizeNode) {
+                    deoptimizations++;
+                }
             }
-            counts.put(probeName(graph.method()), String.format("calls %d   writes %-32s reads %s", calls, show(writes), show(reads)));
+            String method = probeName(graph.method());
+            counts.put(method, String.format("calls %d   writes %-32s reads %s", calls, show(writes), show(reads)));
+            int edges = 0;
+            for (HIRBlock block : cfg.getBlocks()) {
+                edges += block.getSuccessorCount();
+            }
+            control.put(method, String.join("\t", Integer.toString(cfg.getBlocks().length), Integer.toString(edges), Integer.toString(ifs), Integer.toString(otherSplits),
+                    Integer.toString(cfg.getLoops().size()), Integer.toString(exceptionCalls), Integer.toString(deoptimizations)));
+            accessSites.sort(null);
+            sites.put(method, accessSites);
+        }
+
+        /**
+         * The inlining a node came through, innermost first, as method@bci: the same field access inlined at two call sites
+         * is two places. {@code -} where the compilation does not keep source positions (-H:+TrackNodeSourcePosition).
+         */
+        private static String position(Node node) {
+            NodeSourcePosition position = node.getNodeSourcePosition();
+            if (position == null) {
+                return "-";
+            }
+            StringBuilder chain = new StringBuilder();
+            for (NodeSourcePosition at = position; at != null; at = at.getCaller()) {
+                chain.append(chain.length() == 0 ? "" : " < ").append(probeName(at.getMethod())).append('@').append(at.getBCI());
+            }
+            return chain.toString();
         }
 
         private static String show(Map<String, Integer> counted) {
