@@ -26,6 +26,7 @@ import com.oracle.graal.pointsto.export.PointsToExport;
 import com.oracle.svm.core.deopt.DeoptimizationSupport;
 import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.graal.phases.RemoveUnwindPhase;
+import com.oracle.svm.core.util.UserError;
 import com.oracle.svm.hosted.FeatureImpl;
 import com.oracle.svm.hosted.meta.HostedField;
 import com.oracle.svm.hosted.meta.HostedMethod;
@@ -152,6 +153,10 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
 //
         public static final HostedOptionKey<String> SideEffectAnalysisClaimNoAliasing = new HostedOptionKey<>("");
 
+        @Option(help = "Work out which objects other threads can reach, and record the locks and volatile accesses to judge them by. Off (-H:-SideEffectAnalysisThreadEscape) the facts say only that a method acquires or releases, with no list of shared objects, so every acquire and release counts as ordering this thread with another, and no lock or volatile access can be removed or made ordinary: the side-effect analysis then does nothing that depends on a model of concurrency. Not with -H:+SideEffectAnalysisElideLocks, the assumptions or the lock claims.", stability = OptionStability.EXPERIMENTAL)
+//
+        public static final HostedOptionKey<Boolean> SideEffectAnalysisThreadEscape = new HostedOptionKey<>(true);
+
         @Option(help = "Comma-separated assumptions thread escape makes on top of what the points-to analysis shows: thread-confined (the object a thread parks on and its thread locals are read only by it), vm-fields (the virtual machine's own state is read only by it), vm-code (the virtual machine's code stores references only where it reads them), handler-references (the reference handler thread never reads a referent), entry-points (the callers of the roots outside the analysed code pass only shared objects and keep nothing the roots return). Empty: none. The analysis must track the inputs of its flows (-H:+TrackInputFlows) for the last to matter.", stability = OptionStability.EXPERIMENTAL)
 //
         public static final HostedOptionKey<String> SideEffectAnalysisAssumptions = new HostedOptionKey<>("");
@@ -188,6 +193,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
      */
     private final boolean graphs = Options.SideEffectAnalysisExportGraphs.getValue();
     private final boolean elideLocks = Options.SideEffectAnalysisElideLocks.getValue();
+    private final boolean threadEscape = Options.SideEffectAnalysisThreadEscape.getValue();
     private final String ignoredEffects = Options.SideEffectAnalysisIgnoreEffects.getValue();
     private final boolean vm = Options.SideEffectAnalysisKillVMState.getValue();
     private final boolean platform = Options.SideEffectAnalysisKillPlatformFields.getValue();
@@ -253,6 +259,10 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
             Files.createDirectories(out);
             long start = System.nanoTime();
             String assumptions = Options.SideEffectAnalysisAssumptions.getValue();
+            if (!threadEscape && (elideLocks || !assumptions.isEmpty() || !Options.SideEffectAnalysisClaimLocksLocal.getValue().isEmpty())) {
+                throw UserError.abort("-H:-SideEffectAnalysisThreadEscape leaves out what -H:+SideEffectAnalysisElideLocks, -H:SideEffectAnalysisAssumptions and -H:SideEffectAnalysisClaimLocksLocal need");
+            }
+            PointsToExport.THREAD_ESCAPE = threadEscape;
             if (!assumptions.isEmpty()) {
                 PointsToExport.ASSUMPTIONS = Set.of(assumptions.split(","));
             }

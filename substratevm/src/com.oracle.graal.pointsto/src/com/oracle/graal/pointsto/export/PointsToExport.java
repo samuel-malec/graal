@@ -118,6 +118,14 @@ public final class PointsToExport {
      */
     public static volatile Set<String> ASSUMPTIONS = System.getProperty("sideeffects.assumptions", "").isEmpty() ? Set.of() : Set.of(System.getProperty("sideeffects.assumptions").split(","));
 
+    /**
+     * Whether the export works out which objects other threads can reach, and records the locks and volatile accesses to judge
+     * them by. Off, the facts say only that a method acquires or releases, and no list of shared objects: the tool then counts
+     * every acquire and release as ordering this thread with another, which is the sound answer without that knowledge. Set by
+     * the feature.
+     */
+    public static volatile boolean THREAD_ESCAPE = true;
+
     /** Packages treated as "not the program under analysis" by default. */
     private static final String[] PLATFORM = {
                     "java.", "javax.", "jdk.", "sun.", "com.sun.",
@@ -272,11 +280,11 @@ public final class PointsToExport {
         }
 
         start = step("report", start);
-        TreeSet<String> shared = ThreadEscape.sharedObjects(bb, universe, describedAs.apply(analysed, unknown, unresolved), compiled, ASSUMPTIONS, found.unsafeStores, found.opaqueCalls);
+        TreeSet<String> shared = THREAD_ESCAPE ? ThreadEscape.sharedObjects(bb, universe, describedAs.apply(analysed, unknown, unresolved), compiled, ASSUMPTIONS, found.unsafeStores, found.opaqueCalls) : null;
         start = step("thread escape", start);
         // For evaluation: what each assumption adds, from one analysis.
         Map<String, TreeSet<String>> byAssumptions = new TreeMap<>();
-        if (System.getProperty("sideeffects.assumptionLayers") != null) {
+        if (THREAD_ESCAPE && System.getProperty("sideeffects.assumptionLayers") != null) {
             for (String assumptions : List.of("", "thread-confined", "thread-confined,vm-fields", "thread-confined,vm-fields,vm-code", "thread-confined,vm-fields,vm-code,handler-references",
                             "thread-confined,vm-fields,vm-code,handler-references,entry-points", "vm-code,entry-points")) {
                 byAssumptions.put(assumptions.isEmpty() ? "none" : assumptions, ThreadEscape.sharedObjects(bb, universe, describedAs.apply(analysed, unknown, unresolved), compiled,
@@ -287,8 +295,10 @@ public final class PointsToExport {
         // a String can be (2^31 characters).
         Content facts = w -> {
             factsJson(w, analysed, reads, writes, callees, allocates, unknown, acquires, releases, locks, waits, unresolved, accesses, fields, vmWrites, unknownReads, dead);
-            w.write(",\n  \"sharedObjects\": ");
-            GraphExport.writeJson(w, shared);
+            if (shared != null) {
+                w.write(",\n  \"sharedObjects\": ");
+                GraphExport.writeJson(w, shared);
+            }
             if (!byAssumptions.isEmpty()) {
                 w.write(",\n  \"sharedObjectsByAssumptions\": ");
                 GraphExport.writeJson(w, byAssumptions);
@@ -377,7 +387,7 @@ public final class PointsToExport {
             GraphExport.PointsTo synchronizedOn = pointsTo; // made on the first synchronization of a method outside the program
             for (Node n : body.getNodes()) {
                 String at = " at bci " + (n instanceof ValueNode value ? GraphExport.bci(value) : -1);
-                ValueNode[] unsafeStore = unsafeStore(n);
+                ValueNode[] unsafeStore = THREAD_ESCAPE ? unsafeStore(n) : null;
                 if (unsafeStore != null) {
                     // The analysis, when it is conservative about unsafe access, models nothing of these stores.
                     synchronizedOn = synchronizedOn != null ? synchronizedOn : new GraphExport.PointsTo(bb, ptm);
@@ -394,8 +404,10 @@ public final class PointsToExport {
                         // A volatile read acquires, a volatile write releases.
                         String what = "volatile " + (access instanceof LoadFieldNode ? "read of " : "write of ") + field + at;
                         add(access instanceof LoadFieldNode ? f.acquires : f.releases, name, what);
-                        synchronizedOn = synchronizedOn != null ? synchronizedOn : new GraphExport.PointsTo(bb, ptm);
-                        putSite(f.locks.computeIfAbsent(name, k -> new TreeMap<>()), what, synchronizedOn.receivers(access));
+                        if (THREAD_ESCAPE) {
+                            synchronizedOn = synchronizedOn != null ? synchronizedOn : new GraphExport.PointsTo(bb, ptm);
+                            putSite(f.locks.computeIfAbsent(name, k -> new TreeMap<>()), what, synchronizedOn.receivers(access));
+                        }
                     }
                 } else if (n instanceof AccessIndexedNode access) {
                     add(access instanceof LoadIndexedNode ? f.reads : f.writes, name, GraphExport.arrayPartition(access.elementKind()));
@@ -425,7 +437,7 @@ public final class PointsToExport {
                     f.allocates.add(name);
                     add(f.unknownReads, name, n.getClass().getSimpleName() + at);
                 } else if (n instanceof Invoke invoke) {
-                    if (invoke.callTarget() != null && invoke.getTargetMethod() != null && isMonitorQuery(invoke.getTargetMethod()) && !invoke.callTarget().arguments().isEmpty()) {
+                    if (THREAD_ESCAPE && invoke.callTarget() != null && invoke.getTargetMethod() != null && isMonitorQuery(invoke.getTargetMethod()) && !invoke.callTarget().arguments().isEmpty()) {
                         synchronizedOn = synchronizedOn != null ? synchronizedOn : new GraphExport.PointsTo(bb, ptm);
                         putSite(f.waits.computeIfAbsent(name, k -> new TreeMap<>()), invoke.getTargetMethod().getName() + at, synchronizedOn.objects(invoke.callTarget().arguments().get(0)));
                     }
@@ -437,7 +449,7 @@ public final class PointsToExport {
                     if (why != null) {
                         add(compiled && found != null ? f.dead : f.unresolved, name, GraphExport.methodKey(invoke.getTargetMethod()) + at + " (" + why + ")");
                     }
-                    if (found == null && invoke.callTarget() != null) {
+                    if (THREAD_ESCAPE && found == null && invoke.callTarget() != null) {
                         // Code the analysis can't see, a call through a function pointer: it may keep every object it is given.
                         synchronizedOn = synchronizedOn != null ? synchronizedOn : new GraphExport.PointsTo(bb, ptm);
                         List<List<TypeFlow<?>>> arguments = new ArrayList<>();
@@ -453,7 +465,7 @@ public final class PointsToExport {
                     // return its receiver, and every later use take that.
                 } else if ((MemoryKill.isMemoryKill(n) || n instanceof MemoryAccess) && !isBookkeeping(n)) {
                     effects(n, name, n.getClass().getSimpleName() + at, f.reads, f.writes, f.allocates, f.vmWrites, f.unknown, f.unknownReads, f.acquires, f.releases);
-                    if (n instanceof AccessMonitorNode monitor) {
+                    if (THREAD_ESCAPE && n instanceof AccessMonitorNode monitor) {
                         synchronizedOn = synchronizedOn != null ? synchronizedOn : new GraphExport.PointsTo(bb, ptm);
                         putSite(f.locks.computeIfAbsent(name, k -> new TreeMap<>()), n.getClass().getSimpleName() + at, synchronizedOn.objects(monitor.object()));
                     }
