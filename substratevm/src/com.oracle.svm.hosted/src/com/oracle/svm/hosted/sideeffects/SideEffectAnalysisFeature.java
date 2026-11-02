@@ -181,7 +181,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
 //
         public static final HostedOptionKey<String> SideEffectAnalysisIgnoreEffects = new HostedOptionKey<>("");
 
-        @Option(help = "How the counts name this build. Empty: from the other options (graal, kills, objects or graal-dse).", stability = OptionStability.EXPERIMENTAL)
+        @Option(help = "How the counts name this build. Empty: from the other options (graal, fields, objects or graal-dse).", stability = OptionStability.EXPERIMENTAL)
 //
         public static final HostedOptionKey<String> SideEffectAnalysisLabel = new HostedOptionKey<>("");
     }
@@ -204,7 +204,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
     private final List<String> only = prefixes(Options.SideEffectAnalysisOnlyMethods.getValue());
     private final List<String> skip = prefixes(Options.SideEffectAnalysisSkipMethods.getValue());
     private final String label = !Options.SideEffectAnalysisLabel.getValue().isEmpty() ? Options.SideEffectAnalysisLabel.getValue()
-            : !narrow ? "graal" : overwrittenStores ? "graal-dse" : partition.equals("field") ? "kills" : "objects";
+            : !narrow ? "graal" : overwrittenStores ? "graal-dse" : partition.equals("field") ? "fields" : "objects";
 
     /**
      * Method name and descriptor -> the partitions it may write; absent: anything.
