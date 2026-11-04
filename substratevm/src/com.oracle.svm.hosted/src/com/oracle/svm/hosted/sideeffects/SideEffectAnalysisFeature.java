@@ -3,18 +3,24 @@ package com.oracle.svm.hosted.sideeffects;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.stream.Collectors;
@@ -39,6 +45,7 @@ import jdk.graal.compiler.graph.NodeSourcePosition;
 import jdk.graal.compiler.nodes.AbstractDeoptimizeNode;
 import jdk.graal.compiler.nodes.ControlSplitNode;
 import jdk.graal.compiler.nodes.FieldLocationIdentity;
+import jdk.graal.compiler.nodes.FixedNode;
 import jdk.graal.compiler.nodes.GraphState;
 import jdk.graal.compiler.nodes.IfNode;
 import jdk.graal.compiler.nodes.Invoke;
@@ -240,6 +247,20 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
      * and store left in it is, with the inlining it came through and whether it is in a loop (sites.txt).
      */
     private final Map<String, String> control = new ConcurrentHashMap<>();
+    /**
+     * What each of the program's methods looks like at the end of the low tier apart from the loads and stores left in it, for
+     * measuring without the inlining and the unrolling in the way (shape.txt).
+     */
+    private final Map<String, String> shape = new ConcurrentHashMap<>();
+    /**
+     * The call sites each of the program's methods had inlined into it, as callee < caller@bci < ... (inlined.txt), for telling a
+     * load that is gone from one that was never inlined into the method.
+     */
+    private final Map<String, TreeSet<String>> inlinedSites = new ConcurrentHashMap<>();
+    /**
+     * The address at the end of a hidden class's name changes from build to build; the content hash before it does not.
+     */
+    private static final Pattern HIDDEN_CLASS_ADDRESS = Pattern.compile("/0x[0-9a-f]+");
     private final Map<String, List<String>> sites = new ConcurrentHashMap<>();
     /**
      * What each step of the analysis cost in this build, in nanoseconds, and how often it ran: the
@@ -485,6 +506,12 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
             StringBuilder flow = new StringBuilder("# method\tblocks\tcontrol-flow edges\tifs\tswitches and other splits\tloops\tcalls with an exception edge\tdeoptimizations\n");
             new TreeMap<>(control).forEach((method, row) -> flow.append(method).append('\t').append(row).append('\n'));
             Files.writeString(out.resolve("control.txt"), flow);
+            StringBuilder shapes = new StringBuilder("# method\tnodes\tfixed nodes\tlongest path in blocks (back edges cut)\tlongest path in fixed nodes\tdeepest loop\tinlined call sites\tinlining hash (0 without -H:+TrackNodeSourcePosition)\tif places (each if once, however many copies unrolling made)\tcall places\tifs without a place\n");
+            new TreeMap<>(shape).forEach((method, row) -> shapes.append(method).append('\t').append(row).append('\n'));
+            Files.writeString(out.resolve("shape.txt"), shapes);
+            StringBuilder inlinedText = new StringBuilder("# method\tinlined call site: callee < caller@bci < ... (the callee is the method that was inlined; empty without -H:+TrackNodeSourcePosition)\n");
+            new TreeMap<>(inlinedSites).forEach((method, list) -> list.forEach(site -> inlinedText.append(method).append('\t').append(site).append('\n')));
+            Files.writeString(out.resolve("inlined.txt"), inlinedText);
             StringBuilder places = new StringBuilder("# method\tload or store\tin a loop or not\tfield\tinlining it came through, innermost first (- without -H:+TrackNodeSourcePosition)\n");
             new TreeMap<>(sites).forEach((method, list) -> list.forEach(site -> places.append(method).append('\t').append(site).append('\n')));
             Files.writeString(out.resolve("sites.txt"), places);
@@ -912,6 +939,85 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
                     Integer.toString(cfg.getLoops().size()), Integer.toString(exceptionCalls), Integer.toString(deoptimizations)));
             accessSites.sort(null);
             sites.put(method, accessSites);
+            shape.put(method, shapeOf(method, graph, cfg));
+        }
+
+        /**
+         * The graph's size (nodes, fixed nodes), the longest path through its control flow with the back edges cut (in blocks and
+         * in fixed nodes), its deepest loop, and the inlining it was built from: the number of distinct inlined call sites and a
+         * hash of them, so that two methods with the same inlining can be told from two that differ in it (0 and 0 without
+         * -H:+TrackNodeSourcePosition).
+         */
+        private String shapeOf(String method, StructuredGraph graph, ControlFlowGraph cfg) {
+            HIRBlock[] blocks = cfg.getBlocks();
+            Map<HIRBlock, Integer> order = new IdentityHashMap<>();
+            for (int i = 0; i < blocks.length; i++) {
+                order.put(blocks[i], i);
+            }
+            int[] blocksBefore = new int[blocks.length];
+            int[] fixedBefore = new int[blocks.length];
+            int fixedNodes = 0;
+            int longestInBlocks = 0;
+            int longestInFixedNodes = 0;
+            int deepestLoop = 0;
+            for (int i = 0; i < blocks.length; i++) {
+                int weight = 0;
+                for (FixedNode ignored : blocks[i].getNodes()) {
+                    weight++;
+                }
+                fixedNodes += weight;
+                deepestLoop = Math.max(deepestLoop, blocks[i].getLoopDepth());
+                int throughBlocks = blocksBefore[i] + 1;
+                int throughFixedNodes = fixedBefore[i] + weight;
+                longestInBlocks = Math.max(longestInBlocks, throughBlocks);
+                longestInFixedNodes = Math.max(longestInFixedNodes, throughFixedNodes);
+                for (int s = 0; s < blocks[i].getSuccessorCount(); s++) {
+                    int successor = order.get(blocks[i].getSuccessorAt(s));
+                    if (successor > i) { // forward edges only: the back edges of loops are cut
+                        blocksBefore[successor] = Math.max(blocksBefore[successor], throughBlocks);
+                        fixedBefore[successor] = Math.max(fixedBefore[successor], throughFixedNodes);
+                    }
+                }
+            }
+            TreeSet<String> inlined = new TreeSet<>();
+            TreeSet<String> ifPlaces = new TreeSet<>();
+            TreeSet<String> callPlaces = new TreeSet<>();
+            int ifsWithoutPlace = 0;
+            for (Node node : graph.getNodes()) {
+                NodeSourcePosition position = node.getNodeSourcePosition();
+                if (node instanceof IfNode) {
+                    if (position == null) {
+                        ifsWithoutPlace++;
+                    } else {
+                        ifPlaces.add(position(node));
+                    }
+                } else if (node instanceof Invoke && position != null) {
+                    callPlaces.add(position(node));
+                }
+                if (position == null) {
+                    continue;
+                }
+                for (NodeSourcePosition frame = position; frame.getCaller() != null; frame = frame.getCaller()) {
+                    StringBuilder callSite = new StringBuilder(probeName(frame.getMethod()));
+                    for (NodeSourcePosition caller = frame.getCaller(); caller != null; caller = caller.getCaller()) {
+                        callSite.append(" < ").append(probeName(caller.getMethod())).append('@').append(caller.getBCI());
+                    }
+                    inlined.add(HIDDEN_CLASS_ADDRESS.matcher(callSite).replaceAll("/0xH"));
+                }
+            }
+            inlinedSites.put(method, inlined);
+            String hash = "0";
+            if (!inlined.isEmpty()) {
+                try {
+                    byte[] digest = MessageDigest.getInstance("SHA-256").digest(String.join("\n", inlined).getBytes(StandardCharsets.UTF_8));
+                    hash = String.format("%02x%02x%02x%02x", digest[0], digest[1], digest[2], digest[3]);
+                } catch (NoSuchAlgorithmException e) {
+                    throw new IllegalStateException(e);
+                }
+            }
+            return String.join("\t", Integer.toString(graph.getNodeCount()), Integer.toString(fixedNodes), Integer.toString(longestInBlocks), Integer.toString(longestInFixedNodes),
+                            Integer.toString(deepestLoop), Integer.toString(inlined.size()), hash, Integer.toString(ifPlaces.size()), Integer.toString(callPlaces.size()),
+                            Integer.toString(ifsWithoutPlace));
         }
 
         /**
