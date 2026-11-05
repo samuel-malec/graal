@@ -57,7 +57,6 @@ import jdk.graal.compiler.nodeinfo.InputType;
 import jdk.graal.compiler.nodes.AbstractBeginNode;
 import jdk.graal.compiler.nodes.AbstractDeoptimizeNode;
 import jdk.graal.compiler.nodes.AbstractEndNode;
-import jdk.graal.compiler.nodes.AbstractFixedGuardNode;
 import jdk.graal.compiler.nodes.AbstractMergeNode;
 import jdk.graal.compiler.nodes.ConstantNode;
 import jdk.graal.compiler.nodes.LogicNode;
@@ -67,7 +66,6 @@ import jdk.graal.compiler.nodes.PhiNode;
 import jdk.graal.compiler.nodes.ProxyNode;
 import jdk.graal.compiler.nodes.VirtualState;
 import jdk.graal.compiler.nodes.ControlSinkNode;
-import jdk.graal.compiler.nodes.ControlSplitNode;
 import jdk.graal.compiler.nodes.FixedNode;
 import jdk.graal.compiler.nodes.IfNode;
 import jdk.graal.compiler.nodes.Invoke;
@@ -81,15 +79,11 @@ import jdk.graal.compiler.nodes.ValuePhiNode;
 import jdk.graal.compiler.nodes.WithExceptionNode;
 import jdk.graal.compiler.nodes.cfg.ControlFlowGraph;
 import jdk.graal.compiler.nodes.cfg.HIRBlock;
-import jdk.graal.compiler.nodes.extended.AbstractBoxingNode;
-import jdk.graal.compiler.nodes.extended.BytecodeExceptionNode;
 import jdk.graal.compiler.nodes.extended.MembarNode;
-import jdk.graal.compiler.nodes.extended.ValueAnchorNode;
 import jdk.graal.compiler.nodes.java.AbstractNewObjectNode;
 import jdk.graal.compiler.nodes.java.AccessFieldNode;
 import jdk.graal.compiler.nodes.java.AccessIndexedNode;
 import jdk.graal.compiler.nodes.java.AccessMonitorNode;
-import jdk.graal.compiler.nodes.java.ArrayLengthNode;
 import jdk.graal.compiler.nodes.java.ExceptionObjectNode;
 import jdk.graal.compiler.nodes.java.FinalFieldBarrierNode;
 import jdk.graal.compiler.nodes.java.LoadFieldNode;
@@ -750,22 +744,6 @@ final class GraphExport {
             return floating.getBits() > 32 ? "double" : "float";
         }
         return "void";
-    }
-
-    private static boolean isControl(FixedNode node) {
-        return node instanceof AbstractBeginNode || node instanceof AbstractEndNode || node instanceof ControlSinkNode ||
-                        (node instanceof ControlSplitNode && !(node instanceof WithExceptionNode)) ||
-                        node instanceof AbstractFixedGuardNode || node instanceof ValueAnchorNode;
-    }
-
-    /**
-     * A fresh object is unreachable from any
-     * other reference, so initializing it touches no existing partition; array
-     * lengths and box contents never change.
-     */
-    private static boolean isFreshOrImmutable(FixedNode node) {
-        return node instanceof AbstractNewObjectNode || node instanceof CommitAllocationNode || node instanceof BytecodeExceptionNode ||
-                        node instanceof AbstractBoxingNode || node instanceof ArrayLengthNode;
     }
 
     private static String edgeLabel(FixedNode end, AbstractBeginNode to) {

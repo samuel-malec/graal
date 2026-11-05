@@ -57,8 +57,6 @@ final class StoredPlaces {
     final Map<AnalysisField, List<Held>> storedInField = new HashMap<>();
     final List<Held> storedInArrays = new ArrayList<>();
     final List<Held> storedUnsafely = new ArrayList<>();
-    private final Set<Source> storedShared = new HashSet<>();
-    private final Set<Source> storedContentsShared = new HashSet<>();
 
     /** For each place, the types of what was shared of it, so that what a weaker restriction shared is not shared again. */
     private final Map<Integer, Map<Object, List<List<AnalysisType>>>> doneByKey = new HashMap<>();
@@ -97,7 +95,6 @@ final class StoredPlaces {
     void shareSource(Source start, boolean contentsOnly) {
         Deque<Source> queue = new ArrayDeque<>();
         queue.add(start);
-        Set<Source> done = contentsOnly ? storedContentsShared : storedShared;
         while (!queue.isEmpty()) {
             Source at = queue.poll();
             if (ThreadEscape.PROGRESS && ++shareVisits % 100_000 == 0) {
@@ -133,7 +130,6 @@ final class StoredPlaces {
 
     /** Takes a place to share what it holds of the types; false if that, or more, was taken already. */
     boolean claim(Source source, boolean contentsOnly) {
-        Set<Source> done = contentsOnly ? storedContentsShared : storedShared;
         Map<Object, List<List<AnalysisType>>> byKey = doneByKey.computeIfAbsent(contentsOnly ? 1 : 0, k -> new HashMap<>());
         List<List<AnalysisType>> taken = byKey.computeIfAbsent(source.key(), k -> new ArrayList<>());
         for (List<AnalysisType> weaker : taken) {
@@ -141,7 +137,6 @@ final class StoredPlaces {
                 return false;
             }
         }
-        done.add(source);
         taken.add(source.filters());
         return true;
     }

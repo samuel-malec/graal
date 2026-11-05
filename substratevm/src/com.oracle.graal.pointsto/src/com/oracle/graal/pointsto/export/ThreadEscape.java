@@ -625,10 +625,6 @@ final class ThreadEscape {
         }
     }
 
-    private void reach(TypeFlow<?> flow) {
-        reach(flow, flow.getDeclaredType());
-    }
-
     void addAnyOf(AnalysisType type) {
         if (anyOf.add(type) && explain != null) {
             why.recordAnyOf(type);

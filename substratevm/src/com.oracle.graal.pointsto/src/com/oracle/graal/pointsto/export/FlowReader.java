@@ -103,7 +103,6 @@ final class FlowReader {
     private final boolean readFlows;
     private final AnalysisType objectType;
     private final Pattern explain;
-    private final Set<AnalysisObject> known;
     private final Set<AnalysisObject> shared;
     SharingExplanation why;
 
@@ -139,7 +138,6 @@ final class FlowReader {
         this.readFlows = escape.readFlows;
         this.objectType = escape.objectType;
         this.explain = escape.explain;
-        this.known = escape.known;
         this.shared = escape.shared;
     }
 
