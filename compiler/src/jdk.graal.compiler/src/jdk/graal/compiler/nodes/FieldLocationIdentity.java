@@ -36,7 +36,7 @@ public class FieldLocationIdentity extends LocationIdentity implements FormatWit
     private final ResolvedJavaField inner;
     private final boolean immutable;
     /** Which part of the field this is, null for all of it: see {@link #getPartition()}. */
-    private final Object partition;
+    private final String partition;
 
     public FieldLocationIdentity(ResolvedJavaField inner) {
         this(inner, false);
@@ -46,7 +46,7 @@ public class FieldLocationIdentity extends LocationIdentity implements FormatWit
         this(inner, immutable, null);
     }
 
-    public FieldLocationIdentity(ResolvedJavaField inner, boolean immutable, Object partition) {
+    public FieldLocationIdentity(ResolvedJavaField inner, boolean immutable, String partition) {
         this.inner = inner;
         this.immutable = immutable;
         this.partition = partition;
@@ -57,9 +57,10 @@ public class FieldLocationIdentity extends LocationIdentity implements FormatWit
      * of them. A points-to analysis can split a field's objects into partitions that no access
      * spans; locations of different partitions are then different memory. Since locations only
      * overlap when they are equal, a graph must give every access to a field a partition, or
-     * none.
+     * none. A partition is a name, so that the locations an analysis makes apart for the same
+     * partition, such as an access's and a kill's, are equal.
      */
-    public Object getPartition() {
+    public String getPartition() {
         return partition;
     }
 

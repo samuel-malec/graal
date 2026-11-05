@@ -141,8 +141,8 @@ public class OverwrittenStoreEliminationPhase extends Phase {
 
     /** Whether points-to partitions tell the two accesses apart. */
     private static boolean inOtherPartition(AccessFieldNode store, AccessFieldNode other) {
-        Object mine = store.getLocationIdentity() instanceof FieldLocationIdentity location ? location.getPartition() : null;
-        Object theirs = other.getLocationIdentity() instanceof FieldLocationIdentity location ? location.getPartition() : null;
+        String mine = store.getLocationIdentity() instanceof FieldLocationIdentity location ? location.getPartition() : null;
+        String theirs = other.getLocationIdentity() instanceof FieldLocationIdentity location ? location.getPartition() : null;
         return mine != null && theirs != null && !mine.equals(theirs);
     }
 
