@@ -52,10 +52,12 @@ final class Names {
     }
 
     /**
-     * A method as the export names it: LoadStoreElimination.length(LLoadStoreElimination$Link;)I.
+     * A method as the export names it: LoadStoreElimination.length(LLoadStoreElimination$Link;)I,
+     * with a lambda's class named by its content, as the tool's answers name it, not by the address
+     * the build gave it.
      */
     static String exportName(ResolvedJavaMethod method) {
-        return method.getDeclaringClass().toJavaName(true) + "." + method.getName() + method.getSignature().toMethodDescriptor();
+        return PointsToExport.methodKey(method);
     }
 
     /**
@@ -68,9 +70,9 @@ final class Names {
         return method.getDeclaringClass().toJavaName(false) + "." + method.getName() + "(" + parameters + ")";
     }
 
-    /** A field as the export names it: Aliasing$Counter.value. */
+    /** A field as the export names it: Aliasing$Counter.value, a lambda's class by its content. */
     static String fieldName(ResolvedJavaField field) {
-        return field.getDeclaringClass().toJavaName(true) + "." + field.getName();
+        return PointsToExport.fieldName(field);
     }
 
     /** A class's name without its package and the classes it is nested in. */

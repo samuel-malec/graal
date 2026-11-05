@@ -93,6 +93,7 @@ import jdk.graal.compiler.replacements.nodes.BasicArrayCopyNode;
 import jdk.graal.compiler.replacements.nodes.ObjectClone;
 import jdk.vm.ci.code.BytecodePosition;
 import jdk.vm.ci.meta.JavaKind;
+import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 /**
@@ -784,6 +785,20 @@ public final class PointsToExport {
         boolean synchronizes = kind.contains("Monitor") || kind.contains("CompareAndSwap") || kind.contains("CompareAndExchange") || kind.contains("Atomic") ||
                         kind.contains("Membar") || kind.contains("Fence");
         return synchronizes ? Synchronization.BOTH : null;
+    }
+
+    /**
+     * A method as the export names it, and so as the tool's answers do: its class, its name and its
+     * descriptor, with a hidden class named by its content rather than by its address. Hidden
+     * classes are named by the last export.
+     */
+    public static String methodKey(ResolvedJavaMethod method) {
+        return GraphExport.methodKey(method);
+    }
+
+    /** A field as the export names it, a hidden class by its content: see {@link #methodKey}. */
+    public static String fieldName(ResolvedJavaField field) {
+        return GraphExport.fieldName(field);
     }
 
     /** Where a node is, as the exported facts and the decisions about them name it: method:bci, then each caller. */
