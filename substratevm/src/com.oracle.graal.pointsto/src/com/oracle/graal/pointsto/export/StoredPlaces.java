@@ -58,8 +58,12 @@ final class StoredPlaces {
     final List<Held> storedInArrays = new ArrayList<>();
     final List<Held> storedUnsafely = new ArrayList<>();
 
-    /** For each place, the types of what was shared of it, so that what a weaker restriction shared is not shared again. */
-    private final Map<Integer, Map<Object, List<List<AnalysisType>>>> doneByKey = new HashMap<>();
+    /**
+     * For each place, the types of what was shared of it, so that what a weaker restriction shared
+     * is not shared again: of the objects, and of their contents.
+     */
+    private final Map<Object, List<List<AnalysisType>>> taken = new HashMap<>();
+    private final Map<Object, List<List<AnalysisType>>> contentsTaken = new HashMap<>();
 
     /** For the explanation: the place being read, and which place it was reached from. */
     Source currentSource;
@@ -106,7 +110,7 @@ final class StoredPlaces {
             PlaceData data = placeData(at.key());
             ofTypes(data, at.filters(), objects -> objects.forEach(contentsOnly ? escape::shareContents : escape::share));
             Set<AnalysisType> any = new LinkedHashSet<>();
-            narrowAny(any, data.any, at.filters());
+            reader.narrowAny(any, data.any, at.filters());
             for (AnalysisType type : any) {
                 if (contentsOnly) {
                     if (escape.anyContentsOf.add(type) && explain != null) {
@@ -130,14 +134,13 @@ final class StoredPlaces {
 
     /** Takes a place to share what it holds of the types; false if that, or more, was taken already. */
     boolean claim(Source source, boolean contentsOnly) {
-        Map<Object, List<List<AnalysisType>>> byKey = doneByKey.computeIfAbsent(contentsOnly ? 1 : 0, k -> new HashMap<>());
-        List<List<AnalysisType>> taken = byKey.computeIfAbsent(source.key(), k -> new ArrayList<>());
-        for (List<AnalysisType> weaker : taken) {
+        List<List<AnalysisType>> types = (contentsOnly ? contentsTaken : taken).computeIfAbsent(source.key(), k -> new ArrayList<>());
+        for (List<AnalysisType> weaker : types) {
             if (weaker.isEmpty() || weaker.equals(source.filters()) || allAssignable(weaker, source.filters())) {
                 return false;
             }
         }
-        taken.add(source.filters());
+        types.add(source.filters());
         return true;
     }
 
@@ -208,29 +211,6 @@ final class StoredPlaces {
         return data;
     }
 
-    /** Adds the types of a saturated store that can be of the types asked for: the types themselves, or the types asked for that they stand for. */
-    private void narrowAny(Set<AnalysisType> into, Iterable<AnalysisType> any, List<AnalysisType> filters) {
-        for (AnalysisType type : any) {
-            if (reader.matches(filters, type)) {
-                into.add(type);
-                continue;
-            }
-            boolean added = false;
-            boolean unrelated = false;
-            for (AnalysisType filter : filters) {
-                if (type.isAssignableFrom(filter)) {
-                    into.add(filter);
-                    added = true;
-                } else if (!filter.isAssignableFrom(type) && !FlowReader.noObjectHasBoth(type, filter)) {
-                    unrelated = true;
-                }
-            }
-            if (!added && unrelated) {
-                into.add(type);
-            }
-        }
-    }
-
     /** What is stored into the field, or into any array, as far as the sites say, or what feeds a flow that saturated. */
     private List<Held> storedIn(Object where) {
         if (where == FlowReader.ARRAYS) {
@@ -264,7 +244,7 @@ final class StoredPlaces {
     /** Adds what a closure holds of the types, to the objects and the types of a held. */
     private void restrict(Closure closure, List<AnalysisType> filters, Set<AnalysisObject> objects, Set<AnalysisType> any) {
         if (closure.tooMany) {
-            narrowAny(any, List.of(objectType), filters);
+            reader.narrowAny(any, List.of(objectType), filters);
             return;
         }
         if (filters.isEmpty()) {
@@ -277,7 +257,7 @@ final class StoredPlaces {
                 objects.add(object);
             }
         }
-        narrowAny(any, closure.any, filters);
+        reader.narrowAny(any, closure.any, filters);
     }
 
     /** The closure of a place, found with Tarjan's algorithm so that every place on a cycle gets the same one, and none is found twice. */

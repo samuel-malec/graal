@@ -12,7 +12,6 @@ import java.util.regex.Pattern;
 
 import com.oracle.graal.pointsto.PointsToAnalysis;
 import com.oracle.graal.pointsto.export.FlowReader.Held;
-import com.oracle.graal.pointsto.export.FlowReader.StreamSupportHelper;
 import com.oracle.graal.pointsto.export.ThreadEscape.Described;
 import com.oracle.graal.pointsto.export.ThreadEscape.OpaqueCall;
 import com.oracle.graal.pointsto.export.ThreadEscape.UnsafeStore;
@@ -192,7 +191,7 @@ final class PublishingSites {
             if (!(store instanceof OffsetStoreTypeFlow.StoreIndexedTypeFlow) && !readFlows && !bb.analysisPolicy().useConservativeUnsafeAccess() && !universe.getUnsafeAccessedStaticFields().isEmpty()) {
                 // The analysis lets an unsafe store write a static field, whatever the object it stores into; its base is the array that holds statics.
                 Held base = reader.held(reader.observedBy(store, store.receiver()), true);
-                if (base.isNothing() || !base.any().isEmpty() || StreamSupportHelper.hasArray(base.objectsIn(bb))) {
+                if (base.isNothing() || !base.any().isEmpty() || FlowReader.hasArray(base.objectsIn(bb))) {
                     afterCollection.add(() -> {
                         why.because(() -> "an unsafe store in " + method.format("%H.%n") + ", which may write a static field", null);
                         escape.share(reader.held(store.valueFlow(), true));

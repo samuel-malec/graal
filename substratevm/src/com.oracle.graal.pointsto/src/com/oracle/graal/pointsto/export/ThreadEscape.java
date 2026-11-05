@@ -151,13 +151,7 @@ final class ThreadEscape {
     record OpaqueCall(PointsToAnalysisMethod method, String where, List<List<TypeFlow<?>>> arguments) {
     }
 
-    final FlowReader reader;
-    final StoredPlaces places;
-    final PublishingSites sites;
-    final SharingExplanation why;
-    /** The types the regular expression names, when asked to explain; otherwise null. */
-    final Pattern explain;
-
+    /** The package of the virtual machine's own classes. */
     static final String VM = "com.oracle.svm.";
 
     /**
@@ -166,6 +160,19 @@ final class ThreadEscape {
      * holds out of the roots, and {@code summaries}, which stops a shared summary from sharing every object of its type: to see how much of the answer each decides.
      */
     static final Set<String> LEAVE_OUT = Set.of(System.getProperty("sideeffects.controlLeaveOut", "").split(","));
+
+    /** The fields of a thread that it keeps to itself by design, for the {@code thread-confined} assumption. */
+    private static final Set<String> THREAD_CONFINED = Set.of("parkBlocker", "threadLocals");
+
+    /** Whether to print how far the work has come ({@code -Dsideeffects.progress=true}). */
+    static final boolean PROGRESS = Boolean.getBoolean("sideeffects.progress");
+
+    final FlowReader reader;
+    final StoredPlaces places;
+    final PublishingSites sites;
+    final SharingExplanation why;
+    /** The types the regular expression names, when asked to explain; otherwise null. */
+    final Pattern explain;
 
     final PointsToAnalysis bb;
     final AnalysisUniverse universe;
@@ -181,43 +188,52 @@ final class ThreadEscape {
     /** Every object some flow of a reachable method may hold. */
     final Set<AnalysisObject> known = new LinkedHashSet<>();
 
-    /** The known objects not shared yet, and those whose contents are not shared yet, by their type. */
+    /** The known objects not shared yet, by their type. */
     private final Map<AnalysisType, List<AnalysisObject>> unshared = new HashMap<>();
 
+    /** The known objects whose contents are not shared yet, by their type. */
     final Map<AnalysisType, List<AnalysisObject>> uncontained = new HashMap<>();
 
-    /** The objects another thread may reach; those whose contents it may reach, which these are among. */
+    /** The objects another thread may reach. */
     final Set<AnalysisObject> shared = new HashSet<>();
 
+    /** The objects whose contents another thread may reach: the shared ones among them. */
     final Set<AnalysisObject> contents = new HashSet<>();
 
     /** The shared objects that are shared only for the reference handler thread: their referents are not. */
     private final Set<AnalysisObject> handlerOnly = new HashSet<>();
 
-    /** The summaries shared, or with shared contents, only because an object they stand for is. */
+    /** The summaries shared only because an object they stand for is. */
     private final Set<AnalysisObject> derivedShared = new HashSet<>();
 
+    /** The summaries with shared contents only because an object they stand for has them. */
     private final Set<AnalysisObject> derivedContents = new HashSet<>();
+
+    /** The objects shared, or with shared contents, whose consequences are not worked out yet. */
     private final Deque<AnalysisObject> work = new ArrayDeque<>();
+
+    /** The objects whose shared contents, sharing, or referent were worked out. */
     private final Set<AnalysisObject> contentDone = new HashSet<>();
     private final Set<AnalysisObject> fullDone = new HashSet<>();
     private final Set<AnalysisObject> referentDone = new HashSet<>();
 
-    /** The declared types of the saturated flows that share, or share the contents of, all their objects. */
+    /** The declared types of the saturated flows that share all their objects. */
     private final Set<AnalysisType> anyOf = new HashSet<>();
 
+    /** The declared types of the saturated flows that share the contents of all their objects. */
     final Set<AnalysisType> anyContentsOf = new HashSet<>();
 
     /** The states of the flows reached, by identity: all their objects are shared. */
     final Set<TypeState> reached = Collections.newSetFromMap(new IdentityHashMap<>());
 
-    /** The exact types some shared object, or an object with shared contents, has. */
+    /** The exact types some shared object has. */
     private final Set<AnalysisType> sharedTypes = new HashSet<>();
 
+    /** The exact types some object with shared contents has. */
     private final Set<AnalysisType> contentTypes = new HashSet<>();
+
+    /** What is done once every site is collected: the calls, static stores and unsafe stores that share outright. */
     final List<Runnable> afterCollection = new ArrayList<>();
-    private static final Set<String> THREAD_CONFINED = Set.of("parkBlocker", "threadLocals");
-    static final boolean PROGRESS = Boolean.getBoolean("sideeffects.progress");
 
     private ThreadEscape(PointsToAnalysis bb, AnalysisUniverse universe, Function<AnalysisMethod, Described> described, boolean compiled, Set<String> assumptions, List<UnsafeStore> unsafeStores,
                     List<OpaqueCall> opaqueCalls) {

@@ -30,10 +30,7 @@ import com.oracle.graal.pointsto.typestate.TypeState;
  */
 final class SharingExplanation {
 
-    /**
-     * Why an object is shared, kept when asked to explain ({@code -Dsideeffects.explainSharing=<regex
-     * of type names>}): how it was reached and from which shared object.
-     */
+    /** Why an object is shared: how it was reached, from which shared object, and through which flows. */
     record Cause(String how, AnalysisObject from, List<TypeFlow<?>> via) {
     }
 

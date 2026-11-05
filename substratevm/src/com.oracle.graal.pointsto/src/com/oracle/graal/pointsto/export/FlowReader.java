@@ -86,17 +86,6 @@ final class FlowReader {
     private record Pair(List<AnalysisType> a, List<AnalysisType> b) {
     }
 
-    static final class StreamSupportHelper {
-        static boolean hasArray(Iterable<AnalysisObject> objects) {
-            for (AnalysisObject object : objects) {
-                if (object.type().isArray()) {
-                    return true;
-                }
-            }
-            return false;
-        }
-    }
-
     private final ThreadEscape escape;
     private final PointsToAnalysis bb;
     private final Set<String> assumptions;
@@ -121,14 +110,10 @@ final class FlowReader {
     private final Map<Long, Boolean> assignable = new HashMap<>();
     private final Map<AnalysisType, Set<AnalysisType>> subtypes = new HashMap<>();
 
-    /**
-     * What a flow that saturated holds, from the flows that feed it: where they are exact, what they
-     * hold; where one loads from a field, what is stored into the field; where it was injected,
-     * any object of its declared type; or where nothing is known about what feeds it. The analysis
-     * recorded the inputs of its flows if {@code -H:+TrackInputFlows} was given.
-     */
+    /** How many traces of a rebuilt flow that holds any object of a type were printed, when explaining: at most 400. */
     private int anyPrinted;
 
+    /** What each saturated flow rebuilt so far holds. */
     private final Map<TypeFlow<?>, Held> rebuilt = new IdentityHashMap<>();
 
     FlowReader(ThreadEscape escape) {
@@ -288,25 +273,7 @@ final class FlowReader {
             }
         }
         List<AnalysisType> any = new ArrayList<>();
-        for (AnalysisType type : held.any()) {
-            if (matches(filters, type)) {
-                any.add(type);
-                continue;
-            }
-            boolean added = false;
-            boolean unrelated = false;
-            for (AnalysisType filter : filters) {
-                if (type.isAssignableFrom(filter)) {
-                    any.add(filter);
-                    added = true;
-                } else if (!filter.isAssignableFrom(type) && !noObjectHasBoth(type, filter)) {
-                    unrelated = true;
-                }
-            }
-            if (!added && unrelated) {
-                any.add(type);
-            }
-        }
+        narrowAny(any, held.any(), filters);
         List<Source> stored = new ArrayList<>();
         for (Source source : held.stored()) {
             Source narrowed = narrowed(source, filters);
@@ -317,9 +284,45 @@ final class FlowReader {
         return new Held(List.of(), any, stored, objects);
     }
 
+    /** Whether any of the objects is an array. */
+    static boolean hasArray(Iterable<AnalysisObject> objects) {
+        for (AnalysisObject object : objects) {
+            if (object.type().isArray()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Adds the types of saturated flows that can be of the types asked for: the types themselves,
+     * or the types asked for that they stand for.
+     */
+    void narrowAny(Collection<AnalysisType> into, Iterable<AnalysisType> any, List<AnalysisType> filters) {
+        for (AnalysisType type : any) {
+            if (matches(filters, type)) {
+                into.add(type);
+                continue;
+            }
+            boolean added = false;
+            boolean unrelated = false;
+            for (AnalysisType filter : filters) {
+                if (type.isAssignableFrom(filter)) {
+                    into.add(filter);
+                    added = true;
+                } else if (!filter.isAssignableFrom(type) && !noObjectHasBoth(type, filter)) {
+                    unrelated = true;
+                }
+            }
+            if (!added && unrelated) {
+                into.add(type);
+            }
+        }
+    }
+
     /** Whether the objects may include an array: one that is, or a flow that saturated at a type an array may have. */
     boolean mayBeArray(Held held) {
-        if (StreamSupportHelper.hasArray(held.objectsIn(bb))) {
+        if (hasArray(held.objectsIn(bb))) {
             return true;
         }
         for (AnalysisType type : held.any()) {
@@ -377,6 +380,12 @@ final class FlowReader {
         return filtered(new Held(List.of(state), List.of()), filterOf(flow));
     }
 
+    /**
+     * What a flow that saturated holds, from the flows that feed it: where they are exact, what they
+     * hold; where one loads from a field, what is stored into the field; where it was injected,
+     * any object of its declared type; or where nothing is known about what feeds it. The analysis
+     * recorded the inputs of its flows if {@code -H:+TrackInputFlows} was given.
+     */
     Held rebuild(TypeFlow<?> start) {
         return rebuilt.computeIfAbsent(start, this::rebuildFrom);
     }
