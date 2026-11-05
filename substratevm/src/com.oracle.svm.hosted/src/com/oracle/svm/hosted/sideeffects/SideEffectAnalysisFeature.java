@@ -209,11 +209,9 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         if (!threadEscape && (elideLocks || !assumptions.isEmpty() || !Options.SideEffectAnalysisClaimLocksLocal.getValue().isEmpty())) {
             throw UserError.abort("-H:-SideEffectAnalysisThreadEscape leaves out what -H:+SideEffectAnalysisElideLocks, -H:SideEffectAnalysisAssumptions and -H:SideEffectAnalysisClaimLocksLocal need");
         }
-        PointsToExport.THREAD_ESCAPE = threadEscape;
-        if (!assumptions.isEmpty()) {
-            PointsToExport.ASSUMPTIONS = Set.of(assumptions.split(","));
-        }
-        PointsToExport.export((PointsToAnalysis) access.getBigBang(), access.getUniverse(), graphs ? "" : export.toString(), graphs ? export.toString() : "", null, true, program);
+        Set<String> assumed = assumptions.isEmpty() ? PointsToExport.defaultAssumptions() : Set.of(assumptions.split(","));
+        PointsToExport.export((PointsToAnalysis) access.getBigBang(), access.getUniverse(), graphs ? "" : export.toString(), graphs ? export.toString() : "", null, true, program,
+                        threadEscape, assumed);
         times.time("export", start);
         PointsToExport.STEP_NANOS.forEach((step, stepNanos) -> times.add("export: " + step, stepNanos));
         exportBytes = Files.size(export);

@@ -93,36 +93,30 @@ public final class PointsToExport {
                     "CompareAndSetVMThreadLocalNode", "VaListInitializationNode", "VaListNextArgNode", "ExceptionPathNode", "ValidateNewInstanceClassNode",
                     "SubstrateReflectionGetCallerClassNode", "FinalFieldBarrierNode", "SnippetSubstitutionNode", "ForeignCallNode", "RawStoreNode");
 
-    private interface DescribedAs {
-        java.util.function.Function<AnalysisMethod, ThreadEscape.Described> apply(Set<String> analysed, TreeMap<String, TreeSet<String>> unknown, TreeMap<String, TreeSet<String>> unresolved);
+    /**
+     * How well the facts describe a method: not at all, with an effect or a call they can't name
+     * that may store a reference, or whole.
+     */
+    private static java.util.function.Function<AnalysisMethod, ThreadEscape.Described> describedBy(Set<String> analysed, TreeMap<String, TreeSet<String>> unknown) {
+        return method -> {
+            String key = GraphExport.methodKey(method);
+            if (!analysed.contains(key)) {
+                return ThreadEscape.Described.NOTHING;
+            }
+            TreeSet<String> effects = unknown.get(key);
+            return (effects != null && effects.stream().anyMatch(effect -> !STORES_NO_REFERENCE.contains(effect.replaceFirst(" at bci.*", ""))))
+                            ? ThreadEscape.Described.UNKNOWN_EFFECT : ThreadEscape.Described.WHOLE;
+        };
     }
 
-    /** How well the facts describe a method: not at all, with an effect or a call they can't name that may store a reference, or whole. */
-    private static final DescribedAs describedAs = (analysed, unknown, unresolved) -> method -> {
-        String key = GraphExport.methodKey(method);
-        if (!analysed.contains(key)) {
-            return ThreadEscape.Described.NOTHING;
-        }
-        TreeSet<String> effects = unknown.get(key);
-        return (effects != null && effects.stream().anyMatch(effect -> !STORES_NO_REFERENCE.contains(effect.replaceFirst(" at bci.*", ""))))
-                        ? ThreadEscape.Described.UNKNOWN_EFFECT : ThreadEscape.Described.WHOLE;
-    };
-
     /**
-     * The assumptions thread escape makes on top of what the analysis shows, by name:
-     * {@code thread-confined}, {@code vm-fields}, {@code vm-code}, {@code handler-references} and
-     * {@code entry-points}, which {@link ThreadEscape} describes. Set by the feature; none makes the answer follow from the
-     * analysis alone.
+     * The assumptions {@code -Dsideeffects.assumptions} names, comma-separated; none without it.
+     * See {@link #export(PointsToAnalysis, AnalysisUniverse, String, String, PrintStream, boolean, String, boolean, Set)}.
      */
-    public static volatile Set<String> ASSUMPTIONS = System.getProperty("sideeffects.assumptions", "").isEmpty() ? Set.of() : Set.of(System.getProperty("sideeffects.assumptions").split(","));
-
-    /**
-     * Whether the export works out which objects other threads can reach, and records the locks and volatile accesses to judge
-     * them by. Off, the facts say only that a method acquires or releases, and no list of shared objects: the tool then counts
-     * every acquire and release as ordering this thread with another, which is the sound answer without that knowledge. Set by
-     * the feature.
-     */
-    public static volatile boolean THREAD_ESCAPE = true;
+    public static Set<String> defaultAssumptions() {
+        String names = System.getProperty("sideeffects.assumptions", "");
+        return names.isEmpty() ? Set.of() : Set.of(names.split(","));
+    }
 
     /** Packages treated as "not the program under analysis" by default. */
     private static final String[] PLATFORM = {
@@ -130,14 +124,6 @@ public final class PointsToExport {
                     "com.oracle.", "org.graalvm.",
                     "org.ietf.", "org.jcp.", "org.w3c.", "org.xml.",
     };
-
-    /** The program's class-name prefixes, as {@link #isProgramClass(String, String)} takes them. */
-    private static volatile String programPrefix = "";
-
-    /** Whether a class belongs to the program under analysis, as the last export was told. */
-    public static boolean isProgramClass(String className) {
-        return isProgramClass(className, programPrefix);
-    }
 
     /**
      * Whether a class belongs to the program that {@code prefixes} names: comma-separated
@@ -168,15 +154,33 @@ public final class PointsToExport {
     }
 
     /**
+     * Exports what the analysis knows, as {@link #export(PointsToAnalysis, AnalysisUniverse, String,
+     * String, PrintStream, boolean, String, boolean, Set)} does, with thread escape and the
+     * assumptions {@code -Dsideeffects.assumptions} names.
+     */
+    public static void export(PointsToAnalysis bb, AnalysisUniverse universe, String jsonPath, String irPath, PrintStream report, boolean compiled, String programPrefix) {
+        export(bb, universe, jsonPath, irPath, report, compiled, programPrefix, true, defaultAssumptions());
+    }
+
+    /**
      * Exports the facts of every reachable method, and the graphs of the program's, from an
      * analysis that has run: the standalone analyzer's, or Native Image's own, from a feature.
      * An empty path skips that file; the reports go to {@code report}, null for none.
      * {@code compiled} says the graphs are about to be compiled into an image, so calls the
      * analysis found no target for never happen; {@code programPrefix} names the program, as
      * {@link #isProgramClass(String, String)} takes it.
+     * <p>
+     * With {@code threadEscape}, the export works out which objects other threads can reach, and
+     * records the locks and volatile accesses to judge them by. Without it, the facts say only
+     * that a method acquires or releases, and no list of shared objects: the tool then counts every
+     * acquire and release as ordering this thread with another, which is the sound answer without
+     * that knowledge. {@code assumptions} are those thread escape makes on top of what the
+     * analysis shows, by name: {@code thread-confined}, {@code vm-fields}, {@code vm-code},
+     * {@code handler-references} and {@code entry-points}, which {@link ThreadEscape} describes;
+     * none makes the answer follow from the analysis alone.
      */
-    public static void export(PointsToAnalysis bb, AnalysisUniverse universe, String jsonPath, String irPath, PrintStream report, boolean compiled, String programPrefix) {
-        PointsToExport.programPrefix = programPrefix;
+    public static void export(PointsToAnalysis bb, AnalysisUniverse universe, String jsonPath, String irPath, PrintStream report, boolean compiled, String programPrefix,
+                    boolean threadEscape, Set<String> assumptions) {
         STEP_NANOS.clear();
         SITE_LABEL_COLLISIONS.set(0);
         long start = System.nanoTime();
@@ -188,111 +192,32 @@ public final class PointsToExport {
         Facts found = new Facts();
         universe.getMethods().parallelStream()
                         .filter(method -> method.isReachable() && method instanceof PointsToAnalysisMethod ptm && ptm.getTypeFlow().flowsGraphCreated())
-                        .map(method -> collect(bb, (PointsToAnalysisMethod) method, compiled))
+                        .map(method -> collect(bb, (PointsToAnalysisMethod) method, compiled, threadEscape, programPrefix))
                         .toList()
                         .forEach(found::merge);
         if (SITE_LABEL_COLLISIONS.get() > 0) {
             System.err.println("SIDEEFFECT " + SITE_LABEL_COLLISIONS.get() + " locks, volatile accesses or waits had the label of another site in their method; their objects were merged");
         }
-        TreeMap<String, TreeSet<String>> reads = found.reads;
-        TreeMap<String, TreeSet<String>> writes = found.writes;
-        TreeMap<String, TreeSet<String>> callees = found.callees;
-        TreeSet<String> analysed = found.analysed;
-        TreeSet<String> program = found.program;
-        TreeSet<String> allocates = found.allocates;
-        TreeMap<String, TreeSet<String>> unknown = found.unknown;
-        TreeMap<String, TreeSet<String>> acquires = found.acquires;
-        TreeMap<String, TreeSet<String>> releases = found.releases;
-        TreeMap<String, TreeMap<String, Object>> locks = found.locks;
-        TreeMap<String, TreeMap<String, Object>> waits = found.waits;
-        TreeMap<String, TreeSet<String>> unresolved = found.unresolved;
-        TreeMap<String, TreeSet<String>> accesses = found.accesses;
-        TreeMap<String, TreeSet<String>> vmWrites = found.vmWrites;
-        TreeMap<String, TreeSet<String>> unknownReads = found.unknownReads;
-        TreeMap<String, TreeSet<String>> dead = found.dead;
-
         start = step("facts", start);
-        Set<String> all = new TreeSet<>();
-        all.addAll(reads.keySet());
-        all.addAll(writes.keySet());
-        all.retainAll(program);
-
-        out.println();
-        out.println("=== local per-method field effects ===");
-        if (all.isEmpty()) {
-            out.println("  (nothing reported -- wrong -Ddump.filter, or no reachable");
-            out.println("   field accesses in the analysed program?)");
-        }
-        for (String m : all) {
-            out.printf("  %-34s reads=%-28s writes=%s%n",
-                            m,
-                            reads.getOrDefault(m, new TreeSet<>()),
-                            writes.getOrDefault(m, new TreeSet<>()));
-        }
-
-        out.println();
-        out.println("=== call graph with points-to resolved callees ===");
-        for (String m : new TreeSet<>(callees.keySet())) {
-            if (!program.contains(m)) {
-                continue;
-            }
-            TreeSet<String> targets = new TreeSet<>();
-            for (String t : callees.get(m)) {
-                targets.add(isProgramClass(t.substring(0, t.lastIndexOf('.', t.indexOf('(')))) ? t : "<platform>");
-            }
-            targets.remove("<platform>");
-            if (!targets.isEmpty()) {
-                out.printf("  %-34s -> %s%n", m, targets);
-            }
-        }
-
-        out.println();
-        out.println("=== reachable fields ===");
-        TreeMap<String, boolean[]> fields = new TreeMap<>();
-        for (AnalysisField f : universe.getFields()) {
-            if (!isProgramClass(f.getDeclaringClass().toJavaName(true))) {
-                continue;
-            }
-            fields.put(GraphExport.fieldName(f), new boolean[]{f.isRead(), f.isWritten()});
-        }
-        for (var e : fields.entrySet()) {
-            out.printf("  %-30s read=%-6s written=%s%n",
-                            e.getKey(), e.getValue()[0], e.getValue()[1]);
-        }
-
-        out.println();
-        out.println("=== synchronization, memory effects the facts can't name, and calls without a target ===");
-        for (String m : program) {
-            for (String what : acquires.getOrDefault(m, new TreeSet<>())) {
-                out.printf("  %-34s acquire: %s%n", m, what);
-            }
-            for (String what : releases.getOrDefault(m, new TreeSet<>())) {
-                out.printf("  %-34s release: %s%n", m, what);
-            }
-            for (String what : unknown.getOrDefault(m, new TreeSet<>())) {
-                out.printf("  %-34s %s%n", m, what);
-            }
-            for (String what : unresolved.getOrDefault(m, new TreeSet<>())) {
-                out.printf("  %-34s unresolved call to %s%n", m, what);
-            }
-        }
-
+        TreeMap<String, boolean[]> fields = programFields(universe, programPrefix);
+        printReport(out, found, fields, programPrefix);
         start = step("report", start);
-        TreeSet<String> shared = THREAD_ESCAPE ? ThreadEscape.sharedObjects(bb, universe, describedAs.apply(analysed, unknown, unresolved), compiled, ASSUMPTIONS, found.unsafeStores, found.opaqueCalls) : null;
+        TreeSet<String> shared = threadEscape ? ThreadEscape.sharedObjects(bb, universe, describedBy(found.analysed, found.unknown), compiled, assumptions, found.unsafeStores, found.opaqueCalls)
+                        : null;
         start = step("thread escape", start);
         // For evaluation: what each assumption adds, from one analysis.
         Map<String, TreeSet<String>> byAssumptions = new TreeMap<>();
-        if (THREAD_ESCAPE && System.getProperty("sideeffects.assumptionLayers") != null) {
-            for (String assumptions : List.of("", "thread-confined", "thread-confined,vm-fields", "thread-confined,vm-fields,vm-code", "thread-confined,vm-fields,vm-code,handler-references",
+        if (threadEscape && System.getProperty("sideeffects.assumptionLayers") != null) {
+            for (String layer : List.of("", "thread-confined", "thread-confined,vm-fields", "thread-confined,vm-fields,vm-code", "thread-confined,vm-fields,vm-code,handler-references",
                             "thread-confined,vm-fields,vm-code,handler-references,entry-points", "vm-code,entry-points")) {
-                byAssumptions.put(assumptions.isEmpty() ? "none" : assumptions, ThreadEscape.sharedObjects(bb, universe, describedAs.apply(analysed, unknown, unresolved), compiled,
-                                assumptions.isEmpty() ? Set.of() : Set.of(assumptions.split(",")), found.unsafeStores, found.opaqueCalls));
+                byAssumptions.put(layer.isEmpty() ? "none" : layer, ThreadEscape.sharedObjects(bb, universe, describedBy(found.analysed, found.unknown), compiled,
+                                layer.isEmpty() ? Set.of() : Set.of(layer.split(",")), found.unsafeStores, found.opaqueCalls));
             }
         }
         // Written method by method, and the shared objects one by one: with allocation sites the facts and the shared objects are each longer than
         // a String can be (2^31 characters).
         Content facts = w -> {
-            factsJson(w, analysed, reads, writes, callees, allocates, unknown, acquires, releases, locks, waits, unresolved, accesses, fields, vmWrites, unknownReads, dead);
+            found.writeJson(w, fields);
             if (shared != null) {
                 w.write(",\n  \"sharedObjects\": ");
                 GraphExport.writeJson(w, shared);
@@ -316,7 +241,7 @@ public final class PointsToExport {
             List<PointsToAnalysisMethod> methods = new ArrayList<>();
             for (AnalysisMethod method : universe.getMethods()) {
                 if (method.isReachable() && method instanceof PointsToAnalysisMethod ptm && ptm.getTypeFlow().flowsGraphCreated() &&
-                                isProgramClass(method.getDeclaringClass().toJavaName(true))) {
+                                isProgramClass(method.getDeclaringClass().toJavaName(true), programPrefix)) {
                     methods.add(ptm);
                 }
             }
@@ -342,6 +267,82 @@ public final class PointsToExport {
         step("write", start);
     }
 
+    /** The program's fields, and whether the analysis found each read and written. */
+    private static TreeMap<String, boolean[]> programFields(AnalysisUniverse universe, String programPrefix) {
+        TreeMap<String, boolean[]> fields = new TreeMap<>();
+        for (AnalysisField f : universe.getFields()) {
+            if (!isProgramClass(f.getDeclaringClass().toJavaName(true), programPrefix)) {
+                continue;
+            }
+            fields.put(GraphExport.fieldName(f), new boolean[]{f.isRead(), f.isWritten()});
+        }
+        return fields;
+    }
+
+    /**
+     * Prints, for people, what the facts say of the program's methods: the fields each reads and
+     * writes, the calls between them, the program's fields, and what the facts can't name.
+     */
+    private static void printReport(PrintStream out, Facts found, TreeMap<String, boolean[]> fields, String programPrefix) {
+        Set<String> all = new TreeSet<>();
+        all.addAll(found.reads.keySet());
+        all.addAll(found.writes.keySet());
+        all.retainAll(found.program);
+
+        out.println();
+        out.println("=== local per-method field effects ===");
+        if (all.isEmpty()) {
+            out.println("  (nothing reported -- wrong -Ddump.filter, or no reachable");
+            out.println("   field accesses in the analysed program?)");
+        }
+        for (String m : all) {
+            out.printf("  %-34s reads=%-28s writes=%s%n",
+                            m,
+                            found.reads.getOrDefault(m, new TreeSet<>()),
+                            found.writes.getOrDefault(m, new TreeSet<>()));
+        }
+
+        out.println();
+        out.println("=== call graph with points-to resolved callees ===");
+        for (String m : new TreeSet<>(found.callees.keySet())) {
+            if (!found.program.contains(m)) {
+                continue;
+            }
+            TreeSet<String> targets = new TreeSet<>();
+            for (String t : found.callees.get(m)) {
+                targets.add(isProgramClass(t.substring(0, t.lastIndexOf('.', t.indexOf('('))), programPrefix) ? t : "<platform>");
+            }
+            targets.remove("<platform>");
+            if (!targets.isEmpty()) {
+                out.printf("  %-34s -> %s%n", m, targets);
+            }
+        }
+
+        out.println();
+        out.println("=== reachable fields ===");
+        for (var e : fields.entrySet()) {
+            out.printf("  %-30s read=%-6s written=%s%n",
+                            e.getKey(), e.getValue()[0], e.getValue()[1]);
+        }
+
+        out.println();
+        out.println("=== synchronization, memory effects the facts can't name, and calls without a target ===");
+        for (String m : found.program) {
+            for (String what : found.acquires.getOrDefault(m, new TreeSet<>())) {
+                out.printf("  %-34s acquire: %s%n", m, what);
+            }
+            for (String what : found.releases.getOrDefault(m, new TreeSet<>())) {
+                out.printf("  %-34s release: %s%n", m, what);
+            }
+            for (String what : found.unknown.getOrDefault(m, new TreeSet<>())) {
+                out.printf("  %-34s %s%n", m, what);
+            }
+            for (String what : found.unresolved.getOrDefault(m, new TreeSet<>())) {
+                out.printf("  %-34s unresolved call to %s%n", m, what);
+            }
+        }
+    }
+
     /**
      * Adds the time since {@code start} to a step of the export, and gives the time it ends at.
      */
@@ -354,11 +355,11 @@ public final class PointsToExport {
     /**
      * The facts of one reachable method whose flows the analysis made, under the method's name.
      */
-    private static Facts collect(PointsToAnalysis bb, PointsToAnalysisMethod ptm, boolean compiled) {
+    private static Facts collect(PointsToAnalysis bb, PointsToAnalysisMethod ptm, boolean compiled, boolean threadEscape, String programPrefix) {
         AnalysisMethod method = ptm;
         Facts f = new Facts();
         String name = GraphExport.methodKey(method);
-        if (isProgramClass(method.getDeclaringClass().toJavaName(true))) {
+        if (isProgramClass(method.getDeclaringClass().toJavaName(true), programPrefix)) {
             f.program.add(name);
         }
 
@@ -385,7 +386,7 @@ public final class PointsToExport {
             GraphExport.PointsTo synchronizedOn = pointsTo; // made on the first synchronization of a method outside the program
             for (Node n : body.getNodes()) {
                 String at = " at bci " + (n instanceof ValueNode value ? GraphExport.bci(value) : -1);
-                ValueNode[] unsafeStore = THREAD_ESCAPE ? unsafeStore(n) : null;
+                ValueNode[] unsafeStore = threadEscape ? unsafeStore(n) : null;
                 if (unsafeStore != null) {
                     // The analysis, when it is conservative about unsafe access, models nothing of these stores.
                     synchronizedOn = synchronizedOn != null ? synchronizedOn : new GraphExport.PointsTo(bb, ptm);
@@ -402,7 +403,7 @@ public final class PointsToExport {
                         // A volatile read acquires, a volatile write releases.
                         String what = "volatile " + (access instanceof LoadFieldNode ? "read of " : "write of ") + field + at;
                         add(access instanceof LoadFieldNode ? f.acquires : f.releases, name, what);
-                        if (THREAD_ESCAPE) {
+                        if (threadEscape) {
                             synchronizedOn = synchronizedOn != null ? synchronizedOn : new GraphExport.PointsTo(bb, ptm);
                             putSite(f.locks.computeIfAbsent(name, k -> new TreeMap<>()), what, synchronizedOn.receivers(access));
                         }
@@ -435,7 +436,7 @@ public final class PointsToExport {
                     f.allocates.add(name);
                     add(f.unknownReads, name, n.getClass().getSimpleName() + at);
                 } else if (n instanceof Invoke invoke) {
-                    if (THREAD_ESCAPE && invoke.callTarget() != null && invoke.getTargetMethod() != null && isMonitorQuery(invoke.getTargetMethod()) && !invoke.callTarget().arguments().isEmpty()) {
+                    if (threadEscape && invoke.callTarget() != null && invoke.getTargetMethod() != null && isMonitorQuery(invoke.getTargetMethod()) && !invoke.callTarget().arguments().isEmpty()) {
                         synchronizedOn = synchronizedOn != null ? synchronizedOn : new GraphExport.PointsTo(bb, ptm);
                         putSite(f.waits.computeIfAbsent(name, k -> new TreeMap<>()), invoke.getTargetMethod().getName() + at, synchronizedOn.objects(invoke.callTarget().arguments().get(0)));
                     }
@@ -447,7 +448,7 @@ public final class PointsToExport {
                     if (why != null) {
                         add(compiled && found != null ? f.dead : f.unresolved, name, GraphExport.methodKey(invoke.getTargetMethod()) + at + " (" + why + ")");
                     }
-                    if (THREAD_ESCAPE && found == null && invoke.callTarget() != null) {
+                    if (threadEscape && found == null && invoke.callTarget() != null) {
                         // Code the analysis can't see, a call through a function pointer: it may keep every object it is given.
                         synchronizedOn = synchronizedOn != null ? synchronizedOn : new GraphExport.PointsTo(bb, ptm);
                         List<List<TypeFlow<?>>> arguments = new ArrayList<>();
@@ -462,8 +463,8 @@ public final class PointsToExport {
                     // Ordered by the reference: the translation has a constructor
                     // return its receiver, and every later use take that.
                 } else if ((MemoryKill.isMemoryKill(n) || n instanceof MemoryAccess) && !isBookkeeping(n)) {
-                    effects(n, name, n.getClass().getSimpleName() + at, f.reads, f.writes, f.allocates, f.vmWrites, f.unknown, f.unknownReads, f.acquires, f.releases);
-                    if (THREAD_ESCAPE && n instanceof AccessMonitorNode monitor) {
+                    effects(n, name, n.getClass().getSimpleName() + at, f);
+                    if (threadEscape && n instanceof AccessMonitorNode monitor) {
                         synchronizedOn = synchronizedOn != null ? synchronizedOn : new GraphExport.PointsTo(bb, ptm);
                         putSite(f.locks.computeIfAbsent(name, k -> new TreeMap<>()), n.getClass().getSimpleName() + at, synchronizedOn.objects(monitor.object()));
                     }
@@ -586,79 +587,68 @@ public final class PointsToExport {
             other.locks.forEach((m, sites) -> locks.computeIfAbsent(m, k -> new TreeMap<>()).putAll(sites));
             other.waits.forEach((m, sites) -> waits.computeIfAbsent(m, k -> new TreeMap<>()).putAll(sites));
         }
+
+        /**
+         * Writes the facts as the export's "methods" and "fields", one method and one field at a
+         * time.
+         */
+        void writeJson(java.io.Writer out, TreeMap<String, boolean[]> fields) throws java.io.IOException {
+            Set<String> allMethods = new TreeSet<>(analysed);
+            allMethods.addAll(callees.keySet());
+            StringBuilder sb = new StringBuilder();
+            out.write("  \"methods\": {\n");
+            boolean firstMethod = true;
+
+            for (String m : allMethods) {
+                if (!firstMethod) {
+                    out.write(",\n");
+                }
+                firstMethod = false;
+                sb.setLength(0);
+                sb.append("    \"").append(m).append("\": {")
+                                .append("\"reads\": ").append(jsonArray(reads.get(m)))
+                                .append(", \"writes\": ").append(jsonArray(writes.get(m)))
+                                .append(", \"callees\": ").append(jsonArray(callees.get(m)))
+                                .append(", \"allocates\": ").append(allocates.contains(m))
+                                .append(", \"unknown\": ").append(jsonArray(unknown.get(m)))
+                                .append(", \"acquires\": ").append(jsonArray(acquires.get(m)))
+                                .append(", \"releases\": ").append(jsonArray(releases.get(m)))
+                                .append(", \"unresolved\": ").append(jsonArray(unresolved.get(m)))
+                                .append(", \"vmWrites\": ").append(jsonArray(vmWrites.get(m)))
+                                .append(", \"unknownReads\": ").append(jsonArray(unknownReads.get(m)))
+                                .append(", \"dead\": ").append(jsonArray(dead.get(m)));
+                if (accesses.containsKey(m)) {
+                    sb.append(", \"accesses\": [").append(String.join(", ", accesses.get(m))).append("]");
+                }
+                if (locks.containsKey(m)) {
+                    sb.append(", \"locks\": ").append(GraphExport.toJson(locks.get(m), 3));
+                }
+                if (waits.containsKey(m)) {
+                    sb.append(", \"waits\": ").append(GraphExport.toJson(waits.get(m), 3));
+                }
+                sb.append("}");
+                out.append(sb);
+            }
+
+            out.write("\n  },\n  \"fields\": {\n");
+            boolean firstField = true;
+
+            for (var e : fields.entrySet()) {
+                if (!firstField) {
+                    out.write(",\n");
+                }
+                firstField = false;
+                sb.setLength(0);
+                sb.append("    \"").append(e.getKey()).append("\": {")
+                                .append("\"read\": ").append(e.getValue()[0])
+                                .append(", \"written\": ").append(e.getValue()[1])
+                                .append("}");
+                out.append(sb);
+            }
+            out.write("\n  }");
+        }
     }
 
-    private static void factsJson(java.io.Writer out, Set<String> methods,
-                    TreeMap<String, TreeSet<String>> reads,
-                    TreeMap<String, TreeSet<String>> writes,
-                    TreeMap<String, TreeSet<String>> callees,
-                    Set<String> allocates,
-                    TreeMap<String, TreeSet<String>> unknown,
-                    TreeMap<String, TreeSet<String>> acquires,
-                    TreeMap<String, TreeSet<String>> releases,
-                    TreeMap<String, TreeMap<String, Object>> locks,
-                    TreeMap<String, TreeMap<String, Object>> waits,
-                    TreeMap<String, TreeSet<String>> unresolved,
-                    TreeMap<String, TreeSet<String>> accesses,
-                    TreeMap<String, boolean[]> fields,
-                    TreeMap<String, TreeSet<String>> vmWrites,
-                    TreeMap<String, TreeSet<String>> unknownReads,
-                    TreeMap<String, TreeSet<String>> dead) throws java.io.IOException {
-
-        Set<String> allMethods = new TreeSet<>(methods);
-        allMethods.addAll(callees.keySet());
-        StringBuilder sb = new StringBuilder();
-        out.write("  \"methods\": {\n");
-        boolean firstMethod = true;
-
-        for (String m : allMethods) {
-            if (!firstMethod) {
-                out.write(",\n");
-            }
-            firstMethod = false;
-            sb.setLength(0);
-            sb.append("    \"").append(m).append("\": {")
-                            .append("\"reads\": ").append(jsonArray(reads.get(m)))
-                            .append(", \"writes\": ").append(jsonArray(writes.get(m)))
-                            .append(", \"callees\": ").append(jsonArray(callees.get(m)))
-                            .append(", \"allocates\": ").append(allocates.contains(m))
-                            .append(", \"unknown\": ").append(jsonArray(unknown.get(m)))
-                            .append(", \"acquires\": ").append(jsonArray(acquires.get(m)))
-                            .append(", \"releases\": ").append(jsonArray(releases.get(m)))
-                            .append(", \"unresolved\": ").append(jsonArray(unresolved.get(m)))
-                            .append(", \"vmWrites\": ").append(jsonArray(vmWrites.get(m)))
-                            .append(", \"unknownReads\": ").append(jsonArray(unknownReads.get(m)))
-                            .append(", \"dead\": ").append(jsonArray(dead.get(m)));
-            if (accesses.containsKey(m)) {
-                sb.append(", \"accesses\": [").append(String.join(", ", accesses.get(m))).append("]");
-            }
-            if (locks.containsKey(m)) {
-                sb.append(", \"locks\": ").append(GraphExport.toJson(locks.get(m), 3));
-            }
-            if (waits.containsKey(m)) {
-                sb.append(", \"waits\": ").append(GraphExport.toJson(waits.get(m), 3));
-            }
-            sb.append("}");
-            out.append(sb);
-        }
-
-        out.write("\n  },\n  \"fields\": {\n");
-        boolean firstField = true;
-
-        for (var e : fields.entrySet()) {
-            if (!firstField) {
-                out.write(",\n");
-            }
-            firstField = false;
-            sb.setLength(0);
-            sb.append("    \"").append(e.getKey()).append("\": {")
-                            .append("\"read\": ").append(e.getValue()[0])
-                            .append(", \"written\": ").append(e.getValue()[1])
-                            .append("}");
-            out.append(sb);
-        }
-        out.write("\n  }");
-    }
 
     /**
      * Nodes that kill or read memory for Graal's bookkeeping only: the state at
@@ -676,16 +666,14 @@ public final class PointsToExport {
      * other kill of any location may touch anything; a read of any location may read anything,
      * which matters to the tokens but not to what a call may write.
      */
-    private static void effects(Node n, String method, String what, TreeMap<String, TreeSet<String>> reads, TreeMap<String, TreeSet<String>> writes,
-                    Set<String> allocates, TreeMap<String, TreeSet<String>> vmWrites, TreeMap<String, TreeSet<String>> unknown,
-                    TreeMap<String, TreeSet<String>> unknownReads, TreeMap<String, TreeSet<String>> acquires, TreeMap<String, TreeSet<String>> releases) {
+    private static void effects(Node n, String method, String what, Facts f) {
         Synchronization synchronization = synchronization(n);
         if (synchronization != null) {
             if (synchronization.acquires()) {
-                add(acquires, method, what);
+                add(f.acquires, method, what);
             }
             if (synchronization.releases()) {
-                add(releases, method, what);
+                add(f.releases, method, what);
             }
             return;
         }
@@ -693,23 +681,23 @@ public final class PointsToExport {
             LocationIdentity[] killed = MemoryKill.isMultiMemoryKill(n) ? MemoryKill.asMultiMemoryKill(n).getKilledLocationIdentities()
                             : new LocationIdentity[]{MemoryKill.asSingleMemoryKill(n).getKilledLocationIdentity()};
             if (java.util.Arrays.stream(killed).anyMatch(LocationIdentity::isAny)) {
-                add(unknown, method, what);
+                add(f.unknown, method, what);
                 return;
             }
             for (LocationIdentity killedLocation : killed) {
                 if (killedLocation.isInit()) {
-                    allocates.add(method);
+                    f.allocates.add(method);
                 } else if (location(killedLocation) instanceof String written) {
-                    add(written.startsWith("vm:") ? vmWrites : writes, method, written);
+                    add(written.startsWith("vm:") ? f.vmWrites : f.writes, method, written);
                 }
             }
         }
         if (n instanceof MemoryAccess access) {
             LocationIdentity read = access.getLocationIdentity();
             if (read.isAny()) {
-                add(unknownReads, method, what);
+                add(f.unknownReads, method, what);
             } else if (!read.isInit() && location(read) instanceof String location && !location.startsWith("vm:")) {
-                add(reads, method, location);
+                add(f.reads, method, location);
             }
         }
     }
