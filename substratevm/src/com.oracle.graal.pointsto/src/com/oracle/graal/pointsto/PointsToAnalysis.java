@@ -33,6 +33,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -114,6 +115,12 @@ public abstract class PointsToAnalysis extends AbstractAnalysisEngine {
 
     private ConcurrentMap<UnsafeLoadTypeFlow, Boolean> unsafeLoads;
     private ConcurrentMap<UnsafeStoreTypeFlow, Boolean> unsafeStores;
+
+    /**
+     * The parameter flows that the declared types of the parameters of root methods are injected
+     * into, as the callers of a root method are not known: any object of the type may be passed.
+     */
+    private final Set<TypeFlow<?>> rootParameterFlows = ConcurrentHashMap.newKeySet();
 
     public final AtomicLong numParsedGraphs = new AtomicLong();
     private final CompletionExecutor.Timing timing;
@@ -489,13 +496,7 @@ public abstract class PointsToAnalysis extends AbstractAnalysisEngine {
 
     }
 
-    /**
-     * The parameter flows that the declared types of the parameters of root methods are injected
-     * into, as the callers of a root method are not known: any object of the type may be passed.
-     */
-    private final java.util.Set<TypeFlow<?>> rootParameterFlows = java.util.concurrent.ConcurrentHashMap.newKeySet();
-
-    public java.util.Set<TypeFlow<?>> getRootParameterFlows() {
+    public Set<TypeFlow<?>> getRootParameterFlows() {
         return rootParameterFlows;
     }
 

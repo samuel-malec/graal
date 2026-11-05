@@ -25,7 +25,9 @@
 package com.oracle.graal.pointsto.flow.context.object;
 
 import java.lang.reflect.Modifier;
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
@@ -192,9 +194,9 @@ public class AnalysisObject implements Comparable<AnalysisObject> {
      * The field type stores the analysis made for this object's fields, without making any new
      * one: a field no access reached has none, and holds nothing.
      */
-    public java.util.List<FieldTypeStore> getExistingInstanceFieldTypeStores() {
+    public List<FieldTypeStore> getExistingInstanceFieldTypeStores() {
         AtomicReferenceArray<FieldTypeStore> stores = instanceFieldsTypeStore;
-        java.util.List<FieldTypeStore> existing = new java.util.ArrayList<>();
+        List<FieldTypeStore> existing = new ArrayList<>();
         for (int i = 0; stores != null && i < stores.length(); i++) {
             if (stores.get(i) != null) {
                 existing.add(stores.get(i));

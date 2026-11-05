@@ -65,8 +65,8 @@ public interface Invoke extends StateSplit, Lowerable, SingleMemoryKill, Deoptim
     }
 
     /**
-     * The one location a kill set kills:
-     * {@link MemoryKill#NO_LOCATION} for none, {@link LocationIdentity#any()} for two or more.
+     * The one location a kill set kills: {@link MemoryKill#NO_LOCATION} for none,
+     * {@link LocationIdentity#any()} for two or more.
      */
     static LocationIdentity singleKill(LocationIdentity[] locations) {
         return locations.length == 0 ? MemoryKill.NO_LOCATION : locations.length == 1 ? locations[0] : LocationIdentity.any();
