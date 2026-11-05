@@ -11,6 +11,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Consumer;
 import java.util.regex.Pattern;
 
 import com.oracle.graal.pointsto.PointsToAnalysis;
@@ -102,7 +103,7 @@ final class StoredPlaces {
         while (!queue.isEmpty()) {
             Source at = queue.poll();
             if (ThreadEscape.PROGRESS && ++shareVisits % 100_000 == 0) {
-                System.err.println("THREADPROGRESS shared places " + shareVisits + ", queue " + queue.size() + ", shared " + shared.size());
+                PointsToExport.diagnostics().println("THREADPROGRESS shared places " + shareVisits + ", queue " + queue.size() + ", shared " + shared.size());
             }
             if (explain != null) {
                 currentSource = at;
@@ -162,7 +163,7 @@ final class StoredPlaces {
     }
 
     /** Calls the consumer with the objects of each exact type that has all the types: by the hierarchy, not by testing every type. */
-    private void ofTypes(PlaceData data, List<AnalysisType> filters, java.util.function.Consumer<List<AnalysisObject>> consumer) {
+    private void ofTypes(PlaceData data, List<AnalysisType> filters, Consumer<List<AnalysisObject>> consumer) {
         if (filters.isEmpty()) {
             data.byType.values().forEach(consumer);
             return;
@@ -274,7 +275,7 @@ final class StoredPlaces {
         Deque<Object> frames = new ArrayDeque<>();
         Map<Object, Iterator<Source>> next = new HashMap<>();
         int[] counter = {0};
-        java.util.function.Consumer<Object> visit = node -> {
+        Consumer<Object> visit = node -> {
             visits++;
             index.put(node, counter[0]);
             low.put(node, counter[0]);

@@ -24,6 +24,8 @@ import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.meta.AnalysisUniverse;
 import com.oracle.graal.pointsto.typestate.TypeState;
 
+import jdk.vm.ci.code.BytecodePosition;
+
 /**
  * Why an object is shared, kept when asked to ({@code -Dsideeffects.explainSharing=<regex of type names>}):
  * how it was reached and from which shared object. Diagnostics only: nothing here changes the answer.
@@ -115,7 +117,7 @@ final class SharingExplanation {
         } else if (stored instanceof AnalysisField field) {
             return "field " + field.format("%H.%n");
         } else if (stored instanceof TypeFlow<?> flow) {
-            return "flow " + flow.getClass().getSimpleName() + (flow.getSource() instanceof jdk.vm.ci.code.BytecodePosition position ? " at " + GraphExport.PointsTo.site(position) : "");
+            return "flow " + GraphExport.simpleClassName(flow) + (flow.getSource() instanceof BytecodePosition position ? " at " + GraphExport.PointsTo.site(position) : "");
         }
         return String.valueOf(stored);
     }
@@ -152,8 +154,8 @@ final class SharingExplanation {
         }
         // The walk went back from the value to where the object is made; print it the way the object travels.
         for (TypeFlow<?> flow = end; path.size() < 40; flow = next.get(flow)) {
-            String source = flow.getSource() instanceof jdk.vm.ci.code.BytecodePosition position ? " at " + GraphExport.PointsTo.site(position) : "";
-            path.add(flow.getClass().getSimpleName() + source + (flow.isSaturated() ? " (saturated)" : ""));
+            String source = flow.getSource() instanceof BytecodePosition position ? " at " + GraphExport.PointsTo.site(position) : "";
+            path.add(GraphExport.simpleClassName(flow) + source + (flow.isSaturated() ? " (saturated)" : ""));
             if (next.get(flow) == flow) {
                 break;
             }
@@ -200,7 +202,7 @@ final class SharingExplanation {
                 trace.append("\n    at ").append(frames[i].getMethodName()).append(":").append(frames[i].getLineNumber());
             }
             storedPath().forEach(stored -> trace.append("\n    through ").append(describeStored(stored)));
-            System.err.println(trace);
+            PointsToExport.diagnostics().println(trace);
         }
     }
 
@@ -216,8 +218,8 @@ final class SharingExplanation {
                 rootMethods.merge((method.isDirectRootMethod() ? "direct " : "virtual ") + owner + "." + method.getName() + " <- " + (why.length() > 150 ? why.substring(0, 150) : why), 1, Integer::sum);
             }
         }
-        System.err.println("THREADESCAPE " + rootMethods.values().stream().mapToInt(Integer::intValue).sum() + " root methods:");
-        rootMethods.entrySet().stream().limit(5000).forEach(e -> System.err.println("THREADESCAPE   root " + e.getValue() + "  " + e.getKey()));
+        PointsToExport.diagnostics().println("THREADESCAPE " + rootMethods.values().stream().mapToInt(Integer::intValue).sum() + " root methods:");
+        rootMethods.entrySet().stream().limit(5000).forEach(e -> PointsToExport.diagnostics().println("THREADESCAPE   root " + e.getValue() + "  " + e.getKey()));
     }
 
     /** Prints, for the types the pattern names, a few chains of reasons and how the shared objects divide by the reason at the root of their chain. */
@@ -232,11 +234,11 @@ final class SharingExplanation {
             String root = cause == null ? "?" : cause.how().replaceAll("^(any [^ ]+) .*", "$1").replaceAll("^(argument of a call in |result of a call in )[^ ]* (to [^ ]*).*", "$1$2");
             roots.merge(root.length() > 90 ? root.substring(0, 90) : root, 1, Integer::sum);
         }
-        System.err.println("THREADESCAPE shared " + shared.size() + " and with shared contents " + contents.size() + " of " + known.size() + " known objects; by the reason at the root of the chain:");
-        roots.entrySet().stream().sorted((a, b) -> b.getValue() - a.getValue()).limit(25).forEach(e -> System.err.println("THREADESCAPE   " + e.getValue() + "  " + e.getKey()));
+        PointsToExport.diagnostics().println("THREADESCAPE shared " + shared.size() + " and with shared contents " + contents.size() + " of " + known.size() + " known objects; by the reason at the root of the chain:");
+        roots.entrySet().stream().sorted((a, b) -> b.getValue() - a.getValue()).limit(25).forEach(e -> PointsToExport.diagnostics().println("THREADESCAPE   " + e.getValue() + "  " + e.getKey()));
         printRootMethods();
-        System.err.println("THREADESCAPE " + arrayStoresOfAny.size() + " stores into arrays of a value that saturated:");
-        arrayStoresOfAny.stream().sorted().limit(60).forEach(line -> System.err.println("THREADESCAPE   " + line));
+        PointsToExport.diagnostics().println("THREADESCAPE " + arrayStoresOfAny.size() + " stores into arrays of a value that saturated:");
+        arrayStoresOfAny.stream().sorted().limit(60).forEach(line -> PointsToExport.diagnostics().println("THREADESCAPE   " + line));
         for (AnalysisObject object : new TreeSet<>(contents)) {
             String name = GraphExport.PointsTo.objectName(object);
             if (explain.matcher(name).find() && printed.merge("all", 1, Integer::sum) <= 8) {
@@ -257,7 +259,7 @@ final class SharingExplanation {
                     at = cause.from();
                     chain.append("\n    <- ").append(GraphExport.PointsTo.objectName(at));
                 }
-                System.err.println("THREADESCAPE " + chain);
+                PointsToExport.diagnostics().println("THREADESCAPE " + chain);
             }
         }
     }

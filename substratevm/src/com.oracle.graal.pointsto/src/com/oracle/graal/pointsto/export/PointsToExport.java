@@ -1,15 +1,25 @@
 package com.oracle.graal.pointsto.export;
 
+import java.io.IOException;
 import java.io.OutputStream;
 import java.io.PrintStream;
+import java.io.Writer;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
+
+import org.graalvm.word.LocationIdentity;
 
 import com.oracle.graal.pointsto.PointsToAnalysis;
 import com.oracle.graal.pointsto.flow.AccessFieldTypeFlow;
@@ -31,19 +41,18 @@ import jdk.graal.compiler.nodes.NamedLocationIdentity;
 import jdk.graal.compiler.nodes.StartNode;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.ValueNode;
-import jdk.graal.compiler.nodes.java.AbstractNewObjectNode;
-import jdk.graal.compiler.nodes.java.AccessFieldNode;
-import jdk.graal.compiler.nodes.java.AccessMonitorNode;
 import jdk.graal.compiler.nodes.extended.BytecodeExceptionNode;
 import jdk.graal.compiler.nodes.extended.MonitorEnter;
 import jdk.graal.compiler.nodes.extended.MonitorExit;
 import jdk.graal.compiler.nodes.extended.RawLoadNode;
 import jdk.graal.compiler.nodes.extended.RawStoreNode;
+import jdk.graal.compiler.nodes.java.AbstractNewObjectNode;
 import jdk.graal.compiler.nodes.java.AbstractUnsafeCompareAndSwapNode;
-import jdk.graal.compiler.nodes.java.AtomicReadAndWriteNode;
-import jdk.graal.compiler.nodes.type.StampTool;
+import jdk.graal.compiler.nodes.java.AccessFieldNode;
 import jdk.graal.compiler.nodes.java.AccessIndexedNode;
+import jdk.graal.compiler.nodes.java.AccessMonitorNode;
 import jdk.graal.compiler.nodes.java.ArrayLengthNode;
+import jdk.graal.compiler.nodes.java.AtomicReadAndWriteNode;
 import jdk.graal.compiler.nodes.java.ExceptionObjectNode;
 import jdk.graal.compiler.nodes.java.FinalFieldBarrierNode;
 import jdk.graal.compiler.nodes.java.LoadFieldNode;
@@ -54,12 +63,13 @@ import jdk.graal.compiler.nodes.memory.MemoryAccess;
 import jdk.graal.compiler.nodes.memory.MemoryKill;
 import jdk.graal.compiler.nodes.memory.OrderedMemoryAccess;
 import jdk.graal.compiler.nodes.memory.ReadNode;
+import jdk.graal.compiler.nodes.type.StampTool;
 import jdk.graal.compiler.nodes.virtual.CommitAllocationNode;
 import jdk.graal.compiler.replacements.nodes.BasicArrayCopyNode;
 import jdk.graal.compiler.replacements.nodes.ObjectClone;
 import jdk.vm.ci.code.BytecodePosition;
 import jdk.vm.ci.meta.JavaKind;
-import org.graalvm.word.LocationIdentity;
+import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 /**
  * Exports what a points-to analysis that has run knows: the facts of every reachable method (the
@@ -97,7 +107,7 @@ public final class PointsToExport {
      * How well the facts describe a method: not at all, with an effect or a call they can't name
      * that may store a reference, or whole.
      */
-    private static java.util.function.Function<AnalysisMethod, ThreadEscape.Described> describedBy(Set<String> analysed, TreeMap<String, TreeSet<String>> unknown) {
+    private static Function<AnalysisMethod, ThreadEscape.Described> describedBy(Set<String> analysed, TreeMap<String, TreeSet<String>> unknown) {
         return method -> {
             String key = GraphExport.methodKey(method);
             if (!analysed.contains(key)) {
@@ -196,7 +206,7 @@ public final class PointsToExport {
                         .toList()
                         .forEach(found::merge);
         if (SITE_LABEL_COLLISIONS.get() > 0) {
-            System.err.println("SIDEEFFECT " + SITE_LABEL_COLLISIONS.get() + " locks, volatile accesses or waits had the label of another site in their method; their objects were merged");
+            diagnostics().println("SIDEEFFECT " + SITE_LABEL_COLLISIONS.get() + " locks, volatile accesses or waits had the label of another site in their method; their objects were merged");
         }
         start = step("facts", start);
         TreeMap<String, boolean[]> fields = programFields(universe, programPrefix);
@@ -344,6 +354,16 @@ public final class PointsToExport {
     }
 
     /**
+     * Where the export prints its diagnostics, which scripts read from the build's log: the
+     * standard error, as the builder or the standalone analyzer has it when they are printed.
+     */
+    static PrintStream diagnostics() {
+        // Checkstyle: allow System.err (diagnostics that scripts read from the build's log)
+        return System.err;
+        // Checkstyle: disallow System.err
+    }
+
+    /**
      * Adds the time since {@code start} to a step of the export, and gives the time it ends at.
      */
     static long step(String name, long start) {
@@ -371,7 +391,7 @@ public final class PointsToExport {
         } catch (Throwable t) {
             // Decoding a graph again after the analysis fails where a plugin only runs before
             // Native Image seals its registries: then the method may touch anything.
-            add(f.unknown, name, "no graph after the analysis (" + t.getClass().getSimpleName() + ")");
+            add(f.unknown, name, "no graph after the analysis (" + GraphExport.simpleClassName(t) + ")");
             body = null;
         }
         if (body != null) {
@@ -434,7 +454,7 @@ public final class PointsToExport {
                     // Graal says a clone kills anything; it writes the object it makes, which
                     // no caller can have read, and reads all of the one it copies.
                     f.allocates.add(name);
-                    add(f.unknownReads, name, n.getClass().getSimpleName() + at);
+                    add(f.unknownReads, name, GraphExport.simpleClassName(n) + at);
                 } else if (n instanceof Invoke invoke) {
                     if (threadEscape && invoke.callTarget() != null && invoke.getTargetMethod() != null && isMonitorQuery(invoke.getTargetMethod()) && !invoke.callTarget().arguments().isEmpty()) {
                         synchronizedOn = synchronizedOn != null ? synchronizedOn : new GraphExport.PointsTo(bb, ptm);
@@ -463,10 +483,10 @@ public final class PointsToExport {
                     // Ordered by the reference: the translation has a constructor
                     // return its receiver, and every later use take that.
                 } else if ((MemoryKill.isMemoryKill(n) || n instanceof MemoryAccess) && !isBookkeeping(n)) {
-                    effects(n, name, n.getClass().getSimpleName() + at, f);
+                    effects(n, name, GraphExport.simpleClassName(n) + at, f);
                     if (threadEscape && n instanceof AccessMonitorNode monitor) {
                         synchronizedOn = synchronizedOn != null ? synchronizedOn : new GraphExport.PointsTo(bb, ptm);
-                        putSite(f.locks.computeIfAbsent(name, k -> new TreeMap<>()), n.getClass().getSimpleName() + at, synchronizedOn.objects(monitor.object()));
+                        putSite(f.locks.computeIfAbsent(name, k -> new TreeMap<>()), GraphExport.simpleClassName(n) + at, synchronizedOn.objects(monitor.object()));
                     }
                 }
             }
@@ -485,7 +505,7 @@ public final class PointsToExport {
         }
 
         // The call graph, points-to resolved: a virtual call yields every
-        // target the analysis considers possible, not just the declared one. 
+        // target the analysis considers possible, not just the declared one.
         for (InvokeTypeFlow invoke : graph.getInvokes()) {
             for (AnalysisMethod callee : invoke.getOriginalCallees()) {
                 String target = GraphExport.methodKey(callee);
@@ -496,7 +516,7 @@ public final class PointsToExport {
     }
 
     /** How many sites had the label of another site of their method, and had their objects merged with it. */
-    private static final java.util.concurrent.atomic.AtomicInteger SITE_LABEL_COLLISIONS = new java.util.concurrent.atomic.AtomicInteger();
+    private static final AtomicInteger SITE_LABEL_COLLISIONS = new AtomicInteger();
 
     /**
      * Records the objects a lock, a volatile access or a wait may be on, under its label. The label names
@@ -523,7 +543,7 @@ public final class PointsToExport {
     }
 
     /** Whether a call asks about a monitor: waits or notifies on an object, or asks whether the thread holds it. */
-    private static boolean isMonitorQuery(jdk.vm.ci.meta.ResolvedJavaMethod method) {
+    private static boolean isMonitorQuery(ResolvedJavaMethod method) {
         String owner = method.getDeclaringClass().toJavaName(true);
         String name = method.getName();
         return owner.equals("java.lang.Object") && (name.equals("wait") || name.equals("wait0") || name.equals("notify") || name.equals("notifyAll")) ||
@@ -592,7 +612,7 @@ public final class PointsToExport {
          * Writes the facts as the export's "methods" and "fields", one method and one field at a
          * time.
          */
-        void writeJson(java.io.Writer out, TreeMap<String, boolean[]> fields) throws java.io.IOException {
+        void writeJson(Writer out, TreeMap<String, boolean[]> fields) throws IOException {
             Set<String> allMethods = new TreeSet<>(analysed);
             allMethods.addAll(callees.keySet());
             StringBuilder sb = new StringBuilder();
@@ -680,7 +700,7 @@ public final class PointsToExport {
         if (MemoryKill.isMemoryKill(n)) {
             LocationIdentity[] killed = MemoryKill.isMultiMemoryKill(n) ? MemoryKill.asMultiMemoryKill(n).getKilledLocationIdentities()
                             : new LocationIdentity[]{MemoryKill.asSingleMemoryKill(n).getKilledLocationIdentity()};
-            if (java.util.Arrays.stream(killed).anyMatch(LocationIdentity::isAny)) {
+            if (Arrays.stream(killed).anyMatch(LocationIdentity::isAny)) {
                 add(f.unknown, method, what);
                 return;
             }
@@ -736,7 +756,7 @@ public final class PointsToExport {
             }
             return Synchronization.BOTH;
         }
-        String kind = n.getClass().getSimpleName();
+        String kind = GraphExport.simpleClassName(n);
         boolean synchronizes = kind.contains("Monitor") || kind.contains("CompareAndSwap") || kind.contains("CompareAndExchange") || kind.contains("Atomic") ||
                         kind.contains("Membar") || kind.contains("Fence");
         return synchronizes ? Synchronization.BOTH : null;
@@ -781,7 +801,7 @@ public final class PointsToExport {
      * "at": "Examples.length(LExamples$Link;)I:5"}.
      */
     private static void addAccess(TreeMap<String, TreeSet<String>> accesses, String method, String kind, String field, List<String> receivers, Node node) {
-        Map<String, Object> access = new java.util.LinkedHashMap<>();
+        Map<String, Object> access = new LinkedHashMap<>();
         access.put("kind", kind);
         access.put("field", field);
         access.put("receivers", receivers);
@@ -794,21 +814,21 @@ public final class PointsToExport {
      * String can be.
      */
     private interface Content {
-        void writeTo(java.io.Writer out) throws java.io.IOException;
+        void writeTo(Writer out) throws IOException;
     }
 
     private static void write(String path, Content content) {
         try {
-            java.nio.file.Path out = java.nio.file.Path.of(path).toAbsolutePath();
-            java.nio.file.Path parent = out.getParent();
+            Path out = Path.of(path).toAbsolutePath();
+            Path parent = out.getParent();
             if (parent != null) {
-                java.nio.file.Files.createDirectories(parent);
+                Files.createDirectories(parent);
             }
-            try (java.io.Writer writer = java.nio.file.Files.newBufferedWriter(out)) {
+            try (Writer writer = Files.newBufferedWriter(out)) {
                 content.writeTo(writer);
             }
-        } catch (java.io.IOException e) {
-            throw new RuntimeException("could not write " + path, e);
+        } catch (IOException e) {
+            throw new RuntimeException("Could not write " + path, e);
         }
     }
 

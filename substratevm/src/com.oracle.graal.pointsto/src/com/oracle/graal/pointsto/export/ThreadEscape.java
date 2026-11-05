@@ -1,5 +1,6 @@
 package com.oracle.graal.pointsto.export;
 
+import java.lang.ref.Reference;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -37,6 +38,8 @@ import com.oracle.graal.pointsto.meta.PointsToAnalysisMethod;
 import com.oracle.graal.pointsto.typestate.TypeState;
 import com.oracle.graal.pointsto.typestore.ArrayElementsTypeStore;
 import com.oracle.graal.pointsto.typestore.FieldTypeStore;
+
+import jdk.vm.ci.code.BytecodePosition;
 
 /**
  * Which objects of the points-to analysis another thread may reach. An object is shared when
@@ -284,10 +287,10 @@ final class ThreadEscape {
         spread();
         PointsToExport.step("thread escape: reachable objects", start);
         if (PROGRESS) {
-            System.err.println("THREADPROGRESS done: places shared " + places.shareVisits + ", closures " + places.closures.size() + ", visits " + places.visits + ", children " + places.childrenSeen + ", shared " + shared.size());
+            PointsToExport.diagnostics().println("THREADPROGRESS done: places shared " + places.shareVisits + ", closures " + places.closures.size() + ", visits " + places.visits + ", children " + places.childrenSeen + ", shared " + shared.size());
         }
         if (explain != null) {
-            System.err.println("THREADESCAPE " + sites.storeSites + " store sites, " + sites.copySites + " copy and clone sites, " + sites.linkedCalls + " calls that link their arguments");
+            PointsToExport.diagnostics().println("THREADESCAPE " + sites.storeSites + " store sites, " + sites.copySites + " copy and clone sites, " + sites.linkedCalls + " calls that link their arguments");
         }
     }
 
@@ -319,7 +322,7 @@ final class ThreadEscape {
                         why.because(() -> "an argument of a call to code the analysis can't see, in " + call.where(), null);
                         if (argument == null) {
                             if (explain != null) {
-                                System.err.println("THREADESCAPE an argument of a call to code the analysis can't see, in " + call.where() + ", has no flow");
+                                PointsToExport.diagnostics().println("THREADESCAPE an argument of a call to code the analysis can't see, in " + call.where() + ", has no flow");
                             }
                             addAnyOf(objectType);
                         } else {
@@ -340,7 +343,7 @@ final class ThreadEscape {
         for (PendingSite pending : sites.pendingSites) {
             sites.register(pending.site(), pending.target());
             if (PROGRESS && ++registered % 2000 == 0) {
-                System.err.println("THREADPROGRESS registered " + registered + " of " + sites.pendingSites.size() + " sites; closures " + places.closures.size() + ", places " + places.placeTable.size() +
+                PointsToExport.diagnostics().println("THREADPROGRESS registered " + registered + " of " + sites.pendingSites.size() + " sites; closures " + places.closures.size() + ", places " + places.placeTable.size() +
                                 ", meets " + reader.meets.size() + ", visits " + places.visits + ", children " + places.childrenSeen + ", " + (System.nanoTime() - start) / 1_000_000 + " ms");
             }
         }
@@ -352,7 +355,7 @@ final class ThreadEscape {
     /** Shares what every thread reaches: static fields, the image heap, threads and references. */
     private void shareRoots() {
         AnalysisType thread = bb.getMetaAccess().lookupJavaType(Thread.class);
-        AnalysisType reference = bb.getMetaAccess().lookupJavaType(java.lang.ref.Reference.class);
+        AnalysisType reference = bb.getMetaAccess().lookupJavaType(Reference.class);
         if (readFlows) {
             for (AnalysisField field : universe.getFields()) {
                 if (field.isStatic() && field instanceof PointsToAnalysisField pointsTo && !isPrivate(field)) {
@@ -554,7 +557,7 @@ final class ThreadEscape {
 
     /** Whether a flow is the virtual machine's, by its source: what it passes on is not what its code stores. */
     boolean inVirtualMachine(TypeFlow<?> flow) {
-        return assumptions.contains("vm-code") && flow.getSource() instanceof jdk.vm.ci.code.BytecodePosition position && position.getMethod() != null &&
+        return assumptions.contains("vm-code") && flow.getSource() instanceof BytecodePosition position && position.getMethod() != null &&
                         position.getMethod().getDeclaringClass().toJavaName(true).startsWith(VM);
     }
 

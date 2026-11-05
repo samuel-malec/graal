@@ -16,6 +16,7 @@ import com.oracle.graal.pointsto.export.ThreadEscape.Described;
 import com.oracle.graal.pointsto.export.ThreadEscape.OpaqueCall;
 import com.oracle.graal.pointsto.export.ThreadEscape.UnsafeStore;
 import com.oracle.graal.pointsto.flow.ArrayCopyTypeFlow;
+import com.oracle.graal.pointsto.flow.CallSiteSensitiveMethodTypeFlow;
 import com.oracle.graal.pointsto.flow.CloneTypeFlow;
 import com.oracle.graal.pointsto.flow.InvokeTypeFlow;
 import com.oracle.graal.pointsto.flow.MethodFlowsGraph;
@@ -169,11 +170,12 @@ final class PublishingSites {
                     why.because(() -> "a store into the static field " + store.field().format("%H.%n") + " in " + method.format("%H.%n"), null);
                     Held stored = reader.held(store.valueFlow(), true);
                     if (explain != null && explain.matcher(store.field().format("%H.%n")).find()) {
-                        System.err.println("THREADESCAPE a store into the static field " + store.field().format("%H.%n") + " shares " + why.describe(stored) + " " + why.summary(stored));
+                        PointsToExport.diagnostics().println("THREADESCAPE a store into the static field " + store.field().format("%H.%n") + " shares " + why.describe(stored) + " " + why.summary(stored));
                         for (FlowReader.Source source : stored.stored()) {
                             if (source.key() instanceof TypeFlow<?> saturated) {
                                 Held rebuilt = reader.rebuild(saturated);
-                                System.err.println("THREADESCAPE   the saturated " + saturated.getClass().getSimpleName() + " of declared type " + saturated.getDeclaredType() + " (filters " + source.filters() + ") is rebuilt as " +
+                                PointsToExport.diagnostics().println("THREADESCAPE   the saturated " + GraphExport.simpleClassName(saturated) + " of declared type " + saturated.getDeclaredType() +
+                                                " (filters " + source.filters() + ") is rebuilt as " +
                                                 why.describe(rebuilt) + " " + why.summary(rebuilt));
                             }
                         }
@@ -236,7 +238,7 @@ final class PublishingSites {
         if (explain != null) {
             site.flows = flows;
             if (explain.matcher(what.get()).find()) {
-                System.err.println("THREADESCAPE site (" + kind + ") " + what.get() + "\n    into " + why.describe(target) + " " + why.summary(target) + "\n    value " + why.describe(stored) + " " + why.summary(stored));
+                PointsToExport.diagnostics().println("THREADESCAPE site (" + kind + ") " + what.get() + "\n    into " + why.describe(target) + " " + why.summary(target) + "\n    value " + why.describe(stored) + " " + why.summary(stored));
             }
         }
         if (kind == Kind.STORE) {
@@ -258,7 +260,7 @@ final class PublishingSites {
                     names.append(GraphExport.PointsTo.objectName(object)).append("; ");
                 }
             }
-            System.err.println("THREADESCAPE registered " + site.what.get() + " into " + count + " objects: " + names + " any " + target.any().stream().map(AnalysisType::toJavaName).toList() + " from " + why.summary(rawTarget));
+            PointsToExport.diagnostics().println("THREADESCAPE registered " + site.what.get() + " into " + count + " objects: " + names + " any " + target.any().stream().map(AnalysisType::toJavaName).toList() + " from " + why.summary(rawTarget));
         }
         for (AnalysisObject object : target.objectsIn(bb)) {
             if (site.kind != Kind.CLONE && object.isEmptyObjectArrayConstant(bb)) {
@@ -298,7 +300,7 @@ final class PublishingSites {
     Held heldOf(PointsToAnalysisMethod method, List<TypeFlow<?>> originals) {
         Held held = Held.NOTHING;
         for (TypeFlow<?> original : originals) {
-            if (method.getTypeFlow() instanceof com.oracle.graal.pointsto.flow.CallSiteSensitiveMethodTypeFlow sensitive) {
+            if (method.getTypeFlow() instanceof CallSiteSensitiveMethodTypeFlow sensitive) {
                 for (MethodFlowsGraph clone : sensitive.getFlows()) {
                     held = held.with(reader.held(clone.lookupCloneOf(bb, original), true));
                 }

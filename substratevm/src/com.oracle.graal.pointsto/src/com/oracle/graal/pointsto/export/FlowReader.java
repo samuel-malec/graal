@@ -433,7 +433,7 @@ final class FlowReader {
                                 for (TypeFlow<?> at = flow; at != null; at = parents.get(at)) {
                                     trace.append("\n    ").append(why.describeStored(at)).append(at.isSaturated() ? " (saturated)" : "").append(" with ").append(at.isSaturated() ? 0 : at.getOutputState(bb).typesCount()).append(" types");
                                 }
-                                System.err.println(trace);
+                                PointsToExport.diagnostics().println(trace);
                             }
                         }
                     }
@@ -457,7 +457,7 @@ final class FlowReader {
                     for (TypeFlow<?> at = parents.get(flow); at != null && trace.length() < 1500; at = parents.get(at)) {
                         trace.append("\n    <- ").append(why.describeStored(at)).append(at.isSaturated() ? " (saturated)" : "");
                     }
-                    System.err.println(trace);
+                    PointsToExport.diagnostics().println(trace);
                 }
             } else {
                 boolean injected = entryPoints && bb.getRootParameterFlows().contains(flow);

@@ -1,6 +1,8 @@
 package com.oracle.graal.pointsto.export;
 
+import java.io.IOException;
 import java.io.PrintStream;
+import java.io.Writer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -22,6 +24,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import com.oracle.graal.pointsto.AbstractAnalysisEngine;
 import com.oracle.graal.pointsto.PointsToAnalysis;
 import com.oracle.graal.pointsto.flow.AnalysisParsedGraph;
 import com.oracle.graal.pointsto.flow.CallSiteSensitiveMethodTypeFlow;
@@ -59,23 +62,24 @@ import jdk.graal.compiler.nodes.AbstractDeoptimizeNode;
 import jdk.graal.compiler.nodes.AbstractEndNode;
 import jdk.graal.compiler.nodes.AbstractMergeNode;
 import jdk.graal.compiler.nodes.ConstantNode;
-import jdk.graal.compiler.nodes.LogicNode;
-import jdk.graal.compiler.nodes.LoopExitNode;
-import jdk.graal.compiler.nodes.NodeView;
-import jdk.graal.compiler.nodes.PhiNode;
-import jdk.graal.compiler.nodes.ProxyNode;
-import jdk.graal.compiler.nodes.VirtualState;
 import jdk.graal.compiler.nodes.ControlSinkNode;
 import jdk.graal.compiler.nodes.FixedNode;
 import jdk.graal.compiler.nodes.IfNode;
 import jdk.graal.compiler.nodes.Invoke;
 import jdk.graal.compiler.nodes.InvokeWithExceptionNode;
+import jdk.graal.compiler.nodes.LogicNode;
+import jdk.graal.compiler.nodes.LoopExitNode;
+import jdk.graal.compiler.nodes.NodeView;
 import jdk.graal.compiler.nodes.ParameterNode;
+import jdk.graal.compiler.nodes.PhiNode;
+import jdk.graal.compiler.nodes.ProxyNode;
 import jdk.graal.compiler.nodes.ReturnNode;
+import jdk.graal.compiler.nodes.ShortCircuitOrNode;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.UnwindNode;
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.ValuePhiNode;
+import jdk.graal.compiler.nodes.VirtualState;
 import jdk.graal.compiler.nodes.WithExceptionNode;
 import jdk.graal.compiler.nodes.cfg.ControlFlowGraph;
 import jdk.graal.compiler.nodes.cfg.HIRBlock;
@@ -86,29 +90,30 @@ import jdk.graal.compiler.nodes.java.AccessIndexedNode;
 import jdk.graal.compiler.nodes.java.AccessMonitorNode;
 import jdk.graal.compiler.nodes.java.ExceptionObjectNode;
 import jdk.graal.compiler.nodes.java.FinalFieldBarrierNode;
+import jdk.graal.compiler.nodes.java.InstanceOfNode;
 import jdk.graal.compiler.nodes.java.LoadFieldNode;
 import jdk.graal.compiler.nodes.java.LoadIndexedNode;
 import jdk.graal.compiler.nodes.java.MethodCallTargetNode;
+import jdk.graal.compiler.nodes.java.NewArrayNode;
 import jdk.graal.compiler.nodes.java.NewInstanceNode;
 import jdk.graal.compiler.nodes.java.StoreFieldNode;
 import jdk.graal.compiler.nodes.util.GraphUtil;
-import jdk.graal.compiler.phases.schedule.SchedulePhase;
-import jdk.graal.compiler.nodes.java.InstanceOfNode;
-import jdk.graal.compiler.nodes.java.NewArrayNode;
 import jdk.graal.compiler.nodes.virtual.AllocatedObjectNode;
 import jdk.graal.compiler.nodes.virtual.CommitAllocationNode;
 import jdk.graal.compiler.nodes.virtual.VirtualArrayNode;
 import jdk.graal.compiler.nodes.virtual.VirtualInstanceNode;
-import jdk.vm.ci.meta.JavaKind;
+import jdk.graal.compiler.phases.schedule.SchedulePhase;
 import jdk.vm.ci.code.BytecodePosition;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaField;
+import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
 
 /**
- * Exports a method's Graal IR annotated with points-to analysis information
+ * Exports a method's Graal IR, scheduled, with what the points-to analysis says of its values; and
+ * the names the export gives methods, fields, classes and objects, and the JSON it writes them as.
  */
 final class GraphExport {
 
@@ -141,7 +146,7 @@ final class GraphExport {
         } catch (VirtualMachineError e) {
             throw e;
         } catch (Throwable t) {
-            unsupported.add("no graph after the analysis (" + t.getClass().getSimpleName() + ")");
+            unsupported.add("no graph after the analysis (" + simpleClassName(t) + ")");
             return out;
         }
         if (graph == null) {
@@ -174,7 +179,7 @@ final class GraphExport {
         return out;
     }
 
-    /** A hidden class's address in its name, Foo$$Lambda/0x00000000a455d0c8, or .0x… in a descriptor. */
+    /** A hidden class's address in its name, Foo$$Lambda/0x00000000a455d0c8, or .0x... in a descriptor. */
     private static final Pattern HIDDEN_ADDRESS = Pattern.compile("(?<=[./])0x[0-9a-f]{8,16}");
 
     /** Each hidden class's address, and what the export names it instead. */
@@ -389,7 +394,10 @@ final class GraphExport {
             return found;
         }
 
-        /** Objects corresponding to a given ValueNode, used to obtain an upper-bound of receivers of an access operation */
+        /**
+         * The names of the objects a value may be, over every context the method was analysed in;
+         * null if the analysis can't name them: a flow saturated, or none was made for the value.
+         */
         List<String> objects(ValueNode reference) {
             TreeSet<String> names = new TreeSet<>();
             Deque<ValueNode> work = new ArrayDeque<>(List.of(reference));
@@ -542,10 +550,10 @@ final class GraphExport {
         out.put("exit", end instanceof ControlSinkNode ? exitKind(end) : null);
 
         Map<String, Object> endInfo = new LinkedHashMap<>();
-        endInfo.put("node", end.getClass().getSimpleName());
+        endInfo.put("node", simpleClassName(end));
         endInfo.put("bci", bci(end));
         if (end instanceof IfNode ifNode) {
-            endInfo.put("cond", ifNode.condition().getClass().getSimpleName());
+            endInfo.put("cond", simpleClassName(ifNode.condition()));
         }
         out.put("end", endInfo);
         return out;
@@ -630,7 +638,7 @@ final class GraphExport {
                     ObjectNames objectNames) {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("id", nodeId(node));
-        out.put("op", node.getClass().getSimpleName().replaceAll("Node$", ""));
+        out.put("op", simpleClassName(node).replaceAll("Node$", ""));
         out.put("type", typeOf(node));
         if (node instanceof PhiNode phi) {
             AbstractMergeNode merge = phi.merge();
@@ -681,7 +689,7 @@ final class GraphExport {
             out.put("kind", arrayPartition(allocation.elementType().getJavaKind()));
         } else if (node instanceof InstanceOfNode test) {
             out.put("class", typeName(test.type().getType()));
-        } else if (node instanceof jdk.graal.compiler.nodes.ShortCircuitOrNode or) {
+        } else if (node instanceof ShortCircuitOrNode or) {
             out.put("negated", List.of(or.isXNegated(), or.isYNegated()));
         } else if (node instanceof VirtualInstanceNode object) {
             out.put("class", typeName(object.type()));
@@ -766,7 +774,7 @@ final class GraphExport {
         if (end instanceof AbstractDeoptimizeNode) {
             return "deopt";
         }
-        return end.getClass().getSimpleName();
+        return simpleClassName(end);
     }
 
     private static int valueId(ValueNode value, Map<String, String> values) {
@@ -791,7 +799,7 @@ final class GraphExport {
         if (value instanceof LoadFieldNode load) {
             return "load " + fieldName(load.field()) + "@" + bci(load);
         }
-        return value.getClass().getSimpleName() + "#" + nodeId(value);
+        return simpleClassName(value) + "#" + nodeId(value);
     }
 
     static int bci(ValueNode node) {
@@ -827,7 +835,7 @@ final class GraphExport {
             position = position.getCaller();
         }
         int bci = position != null ? position.getBCI()
-                        : com.oracle.graal.pointsto.AbstractAnalysisEngine.syntheticSourcePosition(invoke.asFixedNode(), invoke.asFixedNode().graph().method()).getBCI();
+                        : AbstractAnalysisEngine.syntheticSourcePosition(invoke.asFixedNode(), invoke.asFixedNode().graph().method()).getBCI();
         return bci + " " + methodKey(invoke.getTargetMethod());
     }
 
@@ -890,7 +898,7 @@ final class GraphExport {
      * {@code out} one string at a time: the shared objects of a large image are longer than a
      * String can be (2^31 characters).
      */
-    static void writeJson(java.io.Writer out, Collection<String> strings) throws java.io.IOException {
+    static void writeJson(Writer out, Collection<String> strings) throws IOException {
         out.write('[');
         boolean first = true;
         for (String s : strings) {
@@ -903,8 +911,8 @@ final class GraphExport {
         out.write(']');
     }
 
-    /** The JSON of {@link #toJson(Object, int)} for a map of collections of strings, written as {@link #writeJson(java.io.Writer, Collection)} does. */
-    static void writeJson(java.io.Writer out, Map<String, ? extends Collection<String>> byName) throws java.io.IOException {
+    /** The JSON of {@link #toJson(Object, int)} for a map of collections of strings, written as {@link #writeJson(Writer, Collection)} does. */
+    static void writeJson(Writer out, Map<String, ? extends Collection<String>> byName) throws IOException {
         out.write('{');
         boolean first = true;
         for (Map.Entry<String, ? extends Collection<String>> e : byName.entrySet()) {
@@ -924,7 +932,7 @@ final class GraphExport {
      * one element at a time: the graphs of a framework are longer than a String can be (2^31
      * characters).
      */
-    static void writeJson(java.io.Writer out, List<Map<String, Object>> elements, int depth) throws java.io.IOException {
+    static void writeJson(Writer out, List<Map<String, Object>> elements, int depth) throws IOException {
         out.write('[');
         for (int i = 0; i < elements.size(); i++) {
             if (i > 0) {
@@ -939,6 +947,13 @@ final class GraphExport {
             out.write("  ".repeat(depth));
         }
         out.write(']');
+    }
+
+    /** The simple name of an object's class, as the export names nodes, flows and errors by it. */
+    static String simpleClassName(Object object) {
+        // Checkstyle: allow Class.getSimpleName
+        return object.getClass().getSimpleName();
+        // Checkstyle: disallow Class.getSimpleName
     }
 
     private static boolean isScalar(Object value) {
@@ -964,7 +979,7 @@ final class GraphExport {
         }
     }
 
-    private static void quote(java.io.Writer out, String s) throws java.io.IOException {
+    private static void quote(Writer out, String s) throws IOException {
         StringBuilder sb = new StringBuilder(s.length() + 2);
         quote(sb, s);
         out.append(sb);
