@@ -24,9 +24,6 @@
  */
 package com.oracle.svm.hosted.sideeffects;
 
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -84,9 +81,9 @@ final class KillSets {
         this.platform = platform;
     }
 
-    /** Reads what each method may write: method, a tab, and the partitions, or any. */
-    void read(Path kills) throws IOException {
-        for (String line : Files.readAllLines(kills)) {
+    /** Reads what each method may write, a line of kills.txt each: method, a tab, and the partitions, or any. */
+    void read(List<String> kills) {
+        for (String line : kills) {
             methodsWithFacts++;
             String[] parts = line.split("\t", -1);
             if (!parts[1].equals("any")) {

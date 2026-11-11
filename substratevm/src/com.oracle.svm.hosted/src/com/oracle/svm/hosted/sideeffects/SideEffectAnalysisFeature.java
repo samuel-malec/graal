@@ -31,9 +31,13 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.ListIterator;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+import java.util.TreeSet;
 
 import com.oracle.graal.pointsto.PointsToAnalysis;
 import com.oracle.graal.pointsto.export.PointsToExport;
@@ -56,9 +60,11 @@ import jdk.graal.compiler.phases.util.Providers;
  * Applies a side-effect analysis to the image's compilation, in one native-image build. After the
  * points-to analysis, the feature exports its results ({@link PointsToExport}) and runs the
  * explicit-effects tool on them (effects.kills), which says what each method, with everything it
- * calls, may write ({@link KillSets}). Right after Native Image inlines, every call in the
- * program's methods, the inlined ones included, kills only those locations instead of all of
- * memory, and Graal's own phases do the rest ({@link ApplySideEffectAnalysisPhase}). The tool can
+ * calls, may write ({@link KillSets}); with {@code -H:SideEffectAnalysisKillSets=build} the
+ * builder works that out itself from the same facts, without the export. Right after Native Image
+ * inlines, every call in the program's methods, the inlined ones included, kills only those
+ * locations instead of all of memory, and Graal's own phases do the rest
+ * ({@link ApplySideEffectAnalysisPhase}). The tool can
  * also give each access to a field the location of its partition of the objects
  * ({@link FieldPartitions}). A phase at the end of the low tier counts the field stores, field
  * loads and calls left in the program's methods ({@link CompiledCodeCounts}), and timings.txt
@@ -166,6 +172,11 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
 
         @Option(help = "How the counts name this build. Empty: from the other options (graal, fields, objects or graal-dse).", stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<String> SideEffectAnalysisLabel = new HostedOptionKey<>("");
+
+        @Option(help = "Where the kill sets are worked out: tool runs the explicit-effects tool (effects.kills) on the export; " +
+                        "build works them out in the image builder from the same facts, as the tool does, and writes no export unless lock elision or the graphs need it; " +
+                        "both does both and stops the build if they differ. build and both partition by field and leave no effect out.", stability = OptionStability.EXPERIMENTAL)//
+        public static final HostedOptionKey<String> SideEffectAnalysisKillSets = new HostedOptionKey<>("tool");
     }
 
     private final Path out = Path.of(Options.SideEffectAnalysisOutput.getValue());
@@ -182,6 +193,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
     private final boolean elideLocks = Options.SideEffectAnalysisElideLocks.getValue();
     private final boolean threadEscape = Options.SideEffectAnalysisThreadEscape.getValue();
     private final String ignoredEffects = Options.SideEffectAnalysisIgnoreEffects.getValue();
+    private final String killSetsBy = Options.SideEffectAnalysisKillSets.getValue();
     private final List<String> only = prefixes(Options.SideEffectAnalysisOnlyMethods.getValue());
     private final List<String> skip = prefixes(Options.SideEffectAnalysisSkipMethods.getValue());
     private final String label = !Options.SideEffectAnalysisLabel.getValue().isEmpty() ? Options.SideEffectAnalysisLabel.getValue()
@@ -193,6 +205,8 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
     private final LockElision lockElision = new LockElision(Options.SideEffectAnalysisClaimLocksLocal.getValue(), Options.SideEffectAnalysisClaimNoDeoptimization.getValue());
     private final CompiledCodeCounts counts = new CompiledCodeCounts(program);
     private long exportBytes;
+    /** For how many methods the build's kill sets were found equal to the tool's; -1 if not compared. */
+    private int killSetsCompared = -1;
 
     @Override
     public boolean isInConfiguration(IsInConfigurationAccess access) {
@@ -207,14 +221,14 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         Path export = out.resolve("export.json");
         try {
             Files.createDirectories(out);
-            export((FeatureImpl.AfterAnalysisAccessImpl) access, export);
+            List<String> worked = export((FeatureImpl.AfterAnalysisAccessImpl) access, export);
             if (elideLocks) {
                 readLockDecisions(export);
             }
             if (!narrow) {
                 return;
             }
-            readKillSets(export);
+            readKillSets(export, worked);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         } catch (InterruptedException e) {
@@ -226,19 +240,38 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         }
     }
 
-    /** Exports what the points-to analysis found, and adds what its steps cost to the timings. */
-    private void export(FeatureImpl.AfterAnalysisAccessImpl access, Path export) throws IOException {
+    /**
+     * Exports what the points-to analysis found, and adds what its steps cost to the timings. When
+     * the build works out the kill sets, returns them as the tool writes them, and writes the export
+     * only for what still reads it: the tool when the two are compared, lock elision, the graphs.
+     * Null when the tool works them out.
+     */
+    private List<String> export(FeatureImpl.AfterAnalysisAccessImpl access, Path export) throws IOException {
         long start = System.nanoTime();
         String assumptions = Options.SideEffectAnalysisAssumptions.getValue();
         if (!threadEscape && (elideLocks || !assumptions.isEmpty() || !Options.SideEffectAnalysisClaimLocksLocal.getValue().isEmpty())) {
             throw UserError.abort("-H:-SideEffectAnalysisThreadEscape leaves out what -H:+SideEffectAnalysisElideLocks, -H:SideEffectAnalysisAssumptions and -H:SideEffectAnalysisClaimLocksLocal need");
         }
+        if (!List.of("tool", "build", "both").contains(killSetsBy)) {
+            throw UserError.abort("-H:SideEffectAnalysisKillSets is tool, build or both, not %s", killSetsBy);
+        }
+        boolean inBuild = narrow && !killSetsBy.equals("tool");
+        if (inBuild && (!partition.equals("field") || !ignoredEffects.isEmpty())) {
+            throw UserError.abort("-H:SideEffectAnalysisKillSets=%s partitions by field and leaves no effect out: -H:SideEffectAnalysisPartition and -H:SideEffectAnalysisIgnoreEffects need the tool",
+                            killSetsBy);
+        }
+        boolean written = !(narrow && killSetsBy.equals("build")) || elideLocks || graphs;
+        if (!written) {
+            // Not this build's: nothing may read an export an earlier build left here.
+            Files.deleteIfExists(export);
+        }
         Set<String> assumed = assumptions.isEmpty() ? PointsToExport.defaultAssumptions() : Set.of(assumptions.split(","));
-        PointsToExport.export((PointsToAnalysis) access.getBigBang(), access.getUniverse(), graphs ? "" : export.toString(), graphs ? export.toString() : "", null, true, program,
-                        threadEscape, assumed);
+        List<String> worked = PointsToExport.export((PointsToAnalysis) access.getBigBang(), access.getUniverse(), written && !graphs ? export.toString() : "",
+                        written && graphs ? export.toString() : "", null, true, program, threadEscape, assumed, inBuild);
         times.time("export", start);
         PointsToExport.STEP_NANOS.forEach((step, stepNanos) -> times.add("export: " + step, stepNanos));
-        exportBytes = Files.size(export);
+        exportBytes = written ? Files.size(export) : 0;
+        return worked;
     }
 
     /** Runs effects.elide on the export, and reads the monitors and volatile accesses it says can go. */
@@ -248,9 +281,19 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         lockElision.read(locks);
     }
 
-    /** Runs effects.kills on the export, and reads what each method may write and, with objects told apart, each access's partition. */
-    private void readKillSets(Path export) throws IOException, InterruptedException {
+    /**
+     * Reads what each method may write, as the build worked it out ({@code worked}) or as
+     * effects.kills says from the export, with objects told apart each access's partition too. With
+     * both, the build stops if the two differ.
+     */
+    private void readKillSets(Path export, List<String> worked) throws IOException, InterruptedException {
         Path kills = out.resolve("kills.txt");
+        if (killSetsBy.equals("build")) {
+            // What the tool would have written, for what reads kills.txt after the build.
+            Files.write(kills, worked);
+            killSets.read(worked);
+            return;
+        }
         Path accesses = out.resolve("accesses.txt");
         List<String> arguments = new ArrayList<>(List.of(export.toString(), "-o", kills.toString(), "--partition", partition));
         if (!partition.equals("field")) {
@@ -260,10 +303,47 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
             arguments.addAll(List.of("--ignore", ignoredEffects));
         }
         runTool("effects.kills", export, arguments.toArray(new String[0]));
-        killSets.read(kills);
+        List<String> byTool = Files.readAllLines(kills);
+        killSets.read(byTool);
+        if (killSetsBy.equals("both")) {
+            compare(byTool, worked);
+        }
         if (!partition.equals("field")) {
             partitions.read(accesses);
         }
+    }
+
+    /**
+     * Stops the build if a method's kill set worked out in the build is not the tool's, and leaves
+     * the build's in kills-build.txt next to the tool's kills.txt.
+     */
+    private void compare(List<String> byTool, List<String> worked) throws IOException {
+        Map<String, String> tool = byMethod(byTool);
+        Map<String, String> build = byMethod(worked);
+        TreeSet<String> methods = new TreeSet<>(tool.keySet());
+        methods.addAll(build.keySet());
+        List<String> differ = new ArrayList<>();
+        for (String method : methods) {
+            if (!Objects.equals(tool.get(method), build.get(method))) {
+                differ.add(method + ": tool " + tool.get(method) + ", build " + build.get(method));
+            }
+        }
+        if (!differ.isEmpty()) {
+            Files.write(out.resolve("kills-build.txt"), worked);
+            throw UserError.abort("%d of %d methods have another kill set in the build than in the tool (kills-build.txt against kills.txt), the first: %s", differ.size(), methods.size(),
+                            String.join("; ", differ.subList(0, Math.min(5, differ.size()))));
+        }
+        killSetsCompared = methods.size();
+    }
+
+    /** Lines of kills.txt by method: what follows the tab. */
+    private static Map<String, String> byMethod(List<String> lines) {
+        Map<String, String> byMethod = new HashMap<>();
+        for (String line : lines) {
+            int tab = line.indexOf('\t');
+            byMethod.put(line.substring(0, tab), line.substring(tab + 1));
+        }
+        return byMethod;
     }
 
     /**
@@ -354,6 +434,9 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
             StringBuilder timings = new StringBuilder("# step\tseconds\truns (the export and the tool once, a phase once per graph, summed over the compiler's threads)\n");
             times.appendTo(timings);
             timings.append(String.format("# export.json: %d bytes, %d methods with facts%n", exportBytes, killSets.methodsWithFacts()));
+            if (killSetsCompared >= 0) {
+                timings.append(String.format("# kill sets worked out in the build: the tool's for all %d methods%n", killSetsCompared));
+            }
             if (!ignoredEffects.isEmpty()) {
                 timings.append(String.format("# the kill of %s is left out of the kill sets: an upper bound, not sound%n", ignoredEffects));
             }

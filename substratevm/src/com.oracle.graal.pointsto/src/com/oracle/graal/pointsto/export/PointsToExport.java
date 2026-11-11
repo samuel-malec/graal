@@ -216,6 +216,19 @@ public final class PointsToExport {
      */
     public static void export(PointsToAnalysis bb, AnalysisUniverse universe, String jsonPath, String irPath, PrintStream report, boolean compiled, String programPrefix,
                     boolean threadEscape, Set<String> assumptions) {
+        export(bb, universe, jsonPath, irPath, report, compiled, programPrefix, threadEscape, assumptions, false);
+    }
+
+    /**
+     * As {@link #export(PointsToAnalysis, AnalysisUniverse, String, String, PrintStream, boolean, String, boolean, Set)},
+     * and with {@code killSets} also works out from the same facts what each method, with
+     * everything it calls, may write, as the tool's effects.kills does with partitions by field:
+     * the lines the tool writes to kills.txt ({@link KillSetComputation}). With both paths empty,
+     * nothing is written and the facts are collected for the kill sets alone. Null without
+     * {@code killSets}.
+     */
+    public static List<String> export(PointsToAnalysis bb, AnalysisUniverse universe, String jsonPath, String irPath, PrintStream report, boolean compiled, String programPrefix,
+                    boolean threadEscape, Set<String> assumptions, boolean killSets) {
         STEP_NANOS.clear();
         SITE_LABEL_COLLISIONS.set(0);
         long start = System.nanoTime();
@@ -235,11 +248,19 @@ public final class PointsToExport {
         }
         start = step("facts", start);
         TreeMap<String, boolean[]> fields = programFields(universe, programPrefix);
-        printReport(out, found, fields, programPrefix);
+        if (report != null) {
+            // Formatted for no one, the report costs PetClinic's build two seconds.
+            printReport(out, found, fields, programPrefix);
+        }
         start = step("report", start);
         TreeSet<String> shared = threadEscape ? ThreadEscape.sharedObjects(bb, universe, describedBy(found.analysed, found.unknown), compiled, assumptions, found.unsafeStores, found.opaqueCalls)
                         : null;
         start = step("thread escape", start);
+        List<String> kills = null;
+        if (killSets) {
+            kills = KillSetComputation.lines(found, shared);
+            start = step("kill sets", start);
+        }
         // For evaluation: what each assumption adds, from one analysis.
         Map<String, TreeSet<String>> byAssumptions = new TreeMap<>();
         if (threadEscape && System.getProperty("sideeffects.assumptionLayers") != null) {
@@ -300,6 +321,7 @@ public final class PointsToExport {
             out.println("wrote " + graphs.size() + " graphs to " + irPath);
         }
         step("write", start);
+        return kills;
     }
 
     /** The program's fields, and whether the analysis found each read and written. */
@@ -593,7 +615,7 @@ public final class PointsToExport {
     /**
      * The facts of one method, or of all of them once merged, each under the method's name.
      */
-    private static final class Facts {
+    static final class Facts {
         final TreeMap<String, TreeSet<String>> reads = new TreeMap<>();
         final TreeMap<String, TreeSet<String>> writes = new TreeMap<>();
         final TreeMap<String, TreeSet<String>> callees = new TreeMap<>();
