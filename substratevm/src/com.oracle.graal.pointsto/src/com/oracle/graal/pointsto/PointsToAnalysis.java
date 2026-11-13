@@ -38,6 +38,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.stream.StreamSupport;
 
@@ -80,6 +81,7 @@ import jdk.graal.compiler.api.replacements.Fold;
 import jdk.graal.compiler.api.replacements.SnippetReflectionProvider;
 import jdk.graal.compiler.debug.DebugContext;
 import jdk.graal.compiler.debug.Indent;
+import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.options.OptionValues;
 import jdk.graal.compiler.word.WordTypes;
 import jdk.vm.ci.meta.ConstantReflectionProvider;
@@ -121,6 +123,12 @@ public abstract class PointsToAnalysis extends AbstractAnalysisEngine {
      * into, as the callers of a root method are not known: any object of the type may be passed.
      */
     private final Set<TypeFlow<?>> rootParameterFlows = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Given each graph a method's flows are built from, once it is optimized and before they are:
+     * on the thread that builds them, so possibly on several at once. Null for none.
+     */
+    private volatile BiConsumer<PointsToAnalysisMethod, StructuredGraph> graphListener;
 
     public final AtomicLong numParsedGraphs = new AtomicLong();
     private final CompletionExecutor.Timing timing;
@@ -498,6 +506,14 @@ public abstract class PointsToAnalysis extends AbstractAnalysisEngine {
 
     public Set<TypeFlow<?>> getRootParameterFlows() {
         return rootParameterFlows;
+    }
+
+    public BiConsumer<PointsToAnalysisMethod, StructuredGraph> getGraphListener() {
+        return graphListener;
+    }
+
+    public void setGraphListener(BiConsumer<PointsToAnalysisMethod, StructuredGraph> listener) {
+        graphListener = listener;
     }
 
     private void processParam(AnalysisType declaredParamType, TypeFlow<?> actualParameterFlow) {
