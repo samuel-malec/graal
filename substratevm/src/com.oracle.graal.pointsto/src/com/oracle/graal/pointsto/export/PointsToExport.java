@@ -267,13 +267,15 @@ public final class PointsToExport {
      * the lines the tool writes to kills.txt ({@link KillSetComputation}). With both paths empty,
      * nothing is written and the facts are collected for the kill sets alone. Without thread escape,
      * and once {@link #recordDuringAnalysis} has had the analysis record its graphs, the kill sets
-     * are worked out from those, and the graphs are decoded again only for what is written. Null
-     * without {@code killSets}.
+     * are worked out from those, and the graphs are decoded again only for what is written; a
+     * method whose graph doesn't decode again is written with its recorded graph's facts, so the
+     * tool and the build have the same facts of it. Null without {@code killSets}.
      */
     public static List<String> export(PointsToAnalysis bb, AnalysisUniverse universe, String jsonPath, String irPath, PrintStream report, boolean compiled, String programPrefix,
                     boolean threadEscape, Set<String> assumptions, boolean killSets) {
         STEP_NANOS.clear();
         SITE_LABEL_COLLISIONS.set(0);
+        NOT_DECODED_AGAIN.set(0);
         long start = System.nanoTime();
         PrintStream out = report != null ? report : new PrintStream(OutputStream.nullOutputStream());
         // Before any name is made: names are keys, and the keys decide the order things are written in.
@@ -281,15 +283,19 @@ public final class PointsToExport {
         // Thread escape needs the objects of the nodes, which a recorded graph doesn't keep.
         Map<AnalysisMethod, Recorded> recordedGraphs = killSets && !threadEscape ? recorded : null;
         boolean whole = recordedGraphs == null || !jsonPath.isEmpty() || !irPath.isEmpty() || report != null;
-        Facts found = whole ? facts(universe, method -> collect(bb, method, compiled, threadEscape, programPrefix)) : null;
+        Facts found = whole ? facts(universe, method -> collect(bb, method, compiled, threadEscape, programPrefix, recordedGraphs)) : null;
         if (whole) {
             if (SITE_LABEL_COLLISIONS.get() > 0) {
                 diagnostics().println("SIDEEFFECT " + SITE_LABEL_COLLISIONS.get() + " locks, volatile accesses or waits had the label of another site in their method; their objects were merged");
             }
+            if (NOT_DECODED_AGAIN.get() > 0) {
+                diagnostics().println("SIDEEFFECT " + NOT_DECODED_AGAIN.get() + " methods had no graph when decoded again after the analysis; their facts are from the graphs the analysis recorded");
+            }
             start = step("facts", start);
         }
         Facts forKillSets = recordedGraphs == null ? found
-                        : facts(universe, method -> recordedGraphs.get(method) instanceof Recorded graph ? recalled(method, graph, compiled) : collect(bb, method, compiled, threadEscape, programPrefix));
+                        : facts(universe, method -> recordedGraphs.get(method) instanceof Recorded graph ? recalled(method, graph, compiled)
+                                        : collect(bb, method, compiled, threadEscape, programPrefix, recordedGraphs));
         if (recordedGraphs != null) {
             STEP_NANOS.put("recording (summed over the analysis' threads)", RECORDING_NANOS.get());
             start = step("recorded facts", start);
@@ -496,8 +502,11 @@ public final class PointsToExport {
 
     /**
      * The facts of one reachable method whose flows the analysis made, under the method's name.
+     * Where its graph doesn't decode again after the analysis and {@code recordedGraphs} (null
+     * when nothing was recorded) has the method's, they are that graph's, as {@link #recalled}
+     * finds them.
      */
-    private static Facts collect(PointsToAnalysis bb, PointsToAnalysisMethod ptm, boolean compiled, boolean threadEscape, String programPrefix) {
+    private static Facts collect(PointsToAnalysis bb, PointsToAnalysisMethod ptm, boolean compiled, boolean threadEscape, String programPrefix, Map<AnalysisMethod, Recorded> recordedGraphs) {
         AnalysisMethod method = ptm;
         Facts f = new Facts();
         String name = GraphExport.methodKey(method);
@@ -506,15 +515,25 @@ public final class PointsToExport {
         }
 
         StructuredGraph body;
+        String failure = null;
         try {
             body = GraphExport.analysisGraph(bb, ptm);
         } catch (VirtualMachineError e) {
             throw e;
         } catch (Throwable t) {
+            failure = GraphExport.simpleClassName(t);
+            body = null;
+        }
+        if (body == null && recordedGraphs != null && recordedGraphs.get(method) instanceof Recorded graph) {
+            // The graph the analysis built the flows from, which decoding again would have given:
+            // read as recalled reads it, so that what is written has the facts the kill sets have.
+            NOT_DECODED_AGAIN.incrementAndGet();
+            f.analysed.add(name);
+            graph.replay(new Named(f, name, GraphExport.flows(ptm), compiled));
+        } else if (failure != null) {
             // Decoding a graph again after the analysis fails where a plugin only runs before
             // Native Image seals its registries: then the method may touch anything.
-            add(f.unknown, name, "no graph after the analysis (" + GraphExport.simpleClassName(t) + ")");
-            body = null;
+            add(f.unknown, name, "no graph after the analysis (" + failure + ")");
         }
         if (body != null) {
             f.analysed.add(name);
@@ -850,6 +869,9 @@ public final class PointsToExport {
 
     /** How many sites had the label of another site of their method, and had their objects merged with it. */
     private static final AtomicInteger SITE_LABEL_COLLISIONS = new AtomicInteger();
+
+    /** How many methods had their facts written from the graph the analysis recorded, theirs not decoding again. */
+    private static final AtomicInteger NOT_DECODED_AGAIN = new AtomicInteger();
 
     /**
      * Records the objects a lock, a volatile access or a wait may be on, under its label. The label names
