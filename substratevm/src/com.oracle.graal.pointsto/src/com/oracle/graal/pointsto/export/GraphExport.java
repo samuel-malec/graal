@@ -854,13 +854,22 @@ final class GraphExport {
 
     /** The key of an invoke's flows in {@link #flows}. */
     static String flowKey(Invoke invoke) {
+        return flowKey(flowBci(invoke), invoke.getTargetMethod());
+    }
+
+    /** The key of the flows of a call to {@code target} at the outermost call site {@code bci}. */
+    static String flowKey(int bci, ResolvedJavaMethod target) {
+        return bci + " " + methodKey(target);
+    }
+
+    /** Where the analysis puts an invoke's flows: the outermost call site, see {@link #flows}. */
+    static int flowBci(Invoke invoke) {
         BytecodePosition position = invoke.asFixedNode().getNodeSourcePosition();
         while (position != null && position.getCaller() != null) {
             position = position.getCaller();
         }
-        int bci = position != null ? position.getBCI()
+        return position != null ? position.getBCI()
                         : AbstractAnalysisEngine.syntheticSourcePosition(invoke.asFixedNode(), invoke.asFixedNode().graph().method()).getBCI();
-        return bci + " " + methodKey(invoke.getTargetMethod());
     }
 
     /** An array element's partition, by element kind: boolean[] and byte[] share one, and every reference array is Object[]. */

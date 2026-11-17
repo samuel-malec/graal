@@ -61,7 +61,9 @@ import jdk.graal.compiler.phases.util.Providers;
  * points-to analysis, the feature exports its results ({@link PointsToExport}) and runs the
  * explicit-effects tool on them (effects.kills), which says what each method, with everything it
  * calls, may write ({@link KillSets}); with {@code -H:SideEffectAnalysisKillSets=build} the
- * builder works that out itself from the same facts, without the export. Right after Native Image
+ * builder works that out itself from the same facts, without the export, and without thread escape
+ * takes them from each method's graph as the analysis builds the method's flows from it, so that
+ * no graph is decoded again after the analysis. Right after Native Image
  * inlines, every call in the program's methods, the inlined ones included, kills only those
  * locations instead of all of memory, and Graal's own phases do the rest
  * ({@link ApplySideEffectAnalysisPhase}). The tool can
@@ -175,6 +177,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
 
         @Option(help = "Where the kill sets are worked out: tool runs the explicit-effects tool (effects.kills) on the export; " +
                         "build works them out in the image builder from the same facts, as the tool does, and writes no export unless lock elision or the graphs need it; " +
+                        "without thread escape it takes the facts from each method's graph as the analysis builds the method's flows from it, instead of decoding the graph again after the analysis; " +
                         "both does both and stops the build if they differ. build and both partition by field and leave no effect out.", stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<String> SideEffectAnalysisKillSets = new HostedOptionKey<>("tool");
     }
@@ -211,6 +214,14 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
     @Override
     public boolean isInConfiguration(IsInConfigurationAccess access) {
         return Options.SideEffectAnalysis.getValue();
+    }
+
+    @Override
+    public void beforeAnalysis(BeforeAnalysisAccess access) {
+        // Thread escape needs the objects of each graph's nodes, which the export finds by decoding the graph again.
+        if (narrow && !killSetsBy.equals("tool") && !threadEscape && ((FeatureImpl.BeforeAnalysisAccessImpl) access).getBigBang() instanceof PointsToAnalysis bb) {
+            PointsToExport.recordDuringAnalysis(bb);
+        }
     }
 
     @Override
@@ -268,6 +279,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         Set<String> assumed = assumptions.isEmpty() ? PointsToExport.defaultAssumptions() : Set.of(assumptions.split(","));
         List<String> worked = PointsToExport.export((PointsToAnalysis) access.getBigBang(), access.getUniverse(), written && !graphs ? export.toString() : "",
                         written && graphs ? export.toString() : "", null, true, program, threadEscape, assumed, inBuild);
+        PointsToExport.stopRecording((PointsToAnalysis) access.getBigBang());
         times.time("export", start);
         PointsToExport.STEP_NANOS.forEach((step, stepNanos) -> times.add("export: " + step, stepNanos));
         exportBytes = written ? Files.size(export) : 0;
