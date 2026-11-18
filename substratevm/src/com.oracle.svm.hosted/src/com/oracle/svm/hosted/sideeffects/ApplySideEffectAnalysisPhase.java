@@ -82,17 +82,8 @@ final class ApplySideEffectAnalysisPhase extends TimedPhase {
             if (narrows && node instanceof Invoke invoke && invoke.callTarget() instanceof MethodCallTargetNode target) {
                 LocationIdentity[] locations = killSets.killsOf(target, partitioned);
                 if (locations != null) {
-                    List<LocationIdentity> killed = new ArrayList<>(List.of(locations));
-                    killed.addAll(killSets.killedByEveryCall());
-                    invoke.setKilledLocationIdentities(killed.toArray(new LocationIdentity[0]));
-                    if (invoke instanceof InvokeWithExceptionNode withException && withException.exceptionEdge() instanceof ExceptionObjectNode handler) {
-                        // The handler is entered after the callee threw: before it did, it may
-                        // have written what it writes otherwise.
-                        handler.setKilledLocationIdentities(killed.toArray(new LocationIdentity[0]));
-                    }
-                    LocationIdentity[] set = Invoke.killSet(Arrays.stream(locations).filter(l -> !killSets.isVMState(l)).toArray(LocationIdentity[]::new));
-                    calls.add(String.format("%s kills %s", Names.readableName(target.targetMethod()), set.length == 0 ? "nothing"
-                                    : Arrays.stream(set).map(l -> Names.simpleName(l.toString())).collect(Collectors.joining(" "))));
+                    narrow(invoke, locations);
+                    calls.add(String.format("%s kills %s", Names.readableName(target.targetMethod()), shown(locations)));
                 }
             }
         }
@@ -101,6 +92,27 @@ final class ApplySideEffectAnalysisPhase extends TimedPhase {
             counts.listChanges(graph, calls);
         }
         graph.getDebug().dump(DebugContext.BASIC_LEVEL, graph, "After applying the side-effect analysis");
+    }
+
+    /**
+     * Has a call, and the entry of its exception handler, kill only what its callees may write,
+     * and the VM's state.
+     */
+    private void narrow(Invoke invoke, LocationIdentity[] locations) {
+        List<LocationIdentity> killed = new ArrayList<>(List.of(locations));
+        killed.addAll(killSets.killedByEveryCall());
+        invoke.setKilledLocationIdentities(killed.toArray(new LocationIdentity[0]));
+        if (invoke instanceof InvokeWithExceptionNode withException && withException.exceptionEdge() instanceof ExceptionObjectNode handler) {
+            // The handler is entered after the callee threw: before it did, it may
+            // have written what it writes otherwise.
+            handler.setKilledLocationIdentities(killed.toArray(new LocationIdentity[0]));
+        }
+    }
+
+    /** What a call kills, for counts.txt: the locations by their short names, the VM's state left out. */
+    private String shown(LocationIdentity[] locations) {
+        LocationIdentity[] set = Invoke.killSet(Arrays.stream(locations).filter(l -> !killSets.isVMState(l)).toArray(LocationIdentity[]::new));
+        return set.length == 0 ? "nothing" : Arrays.stream(set).map(l -> Names.simpleName(l.toString())).collect(Collectors.joining(" "));
     }
 
     /**

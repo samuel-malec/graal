@@ -67,6 +67,7 @@ final class LockElision {
      * Control: remove the monitors even in an image that can deoptimize.
      */
     private final boolean claimNoDeoptimization;
+    // What the image lost, over the compiler's threads, for timings.txt.
     private final AtomicInteger monitorsRemoved = new AtomicInteger();
     private final AtomicInteger locksRemoved = new AtomicInteger();
     private final AtomicInteger locksKeptForDeoptimization = new AtomicInteger();
@@ -178,6 +179,7 @@ final class LockElision {
             }
         }
 
+        /** Whether the tool lists a monitor enter or exit, or the control claims it. */
         private boolean listed(AccessMonitorNode monitor) {
             String kind = monitor instanceof MonitorEnterNode && !(monitor instanceof OSRMonitorEnterNode) ? "enter" : monitor instanceof MonitorExitNode ? "exit" : null;
             String at = PointsToExport.position(monitor.getNodeSourcePosition());

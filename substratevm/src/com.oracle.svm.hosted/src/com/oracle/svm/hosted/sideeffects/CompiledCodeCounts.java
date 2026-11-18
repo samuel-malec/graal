@@ -193,17 +193,7 @@ final class CompiledCodeCounts {
                 if (node instanceof Invoke) {
                     calls++;
                 } else if (node instanceof MemoryAccess access && access.getLocationIdentity() instanceof FieldLocationIdentity field) {
-                    HIRBlock block = cfg.blockFor(node);
-                    boolean loop = block != null && block.getLoop() != null;
-                    String where = Names.simpleName(field.getField().format("%H")) + "." + field.getField().getName() + (loop ? "(loop)" : "");
-                    boolean store = node instanceof StoreFieldNode || node instanceof AbstractWriteNode;
-                    Map<String, Integer> counted = store ? writes
-                                    : node instanceof LoadFieldNode || node instanceof ReadNode || node instanceof FloatingReadNode ? reads : null;
-                    if (counted != null) {
-                        counted.merge(where, 1, Integer::sum);
-                        accessSites.add(String.join("\t", store ? "store" : "load", loop ? "loop" : "flat", Names.simpleName(field.getField().format("%H")) + "." + field.getField().getName(),
-                                        position(node)));
-                    }
+                    countAccess(node, field, cfg, writes, reads, accessSites);
                 }
                 if (node instanceof InvokeWithExceptionNode) {
                     exceptionCalls++;
@@ -228,6 +218,23 @@ final class CompiledCodeCounts {
             TreeSet<String> inlined = inlinedCallSites(graph);
             inlinedSites.put(method, inlined);
             shape.put(method, shapeOf(graph, cfg, inlined));
+        }
+    }
+
+    /**
+     * Counts a load or a store of a field, by the field and whether it is in a loop, and lists
+     * where it is. Other accesses to a field's location are not counted.
+     */
+    private static void countAccess(Node node, FieldLocationIdentity field, ControlFlowGraph cfg, Map<String, Integer> writes, Map<String, Integer> reads, List<String> accessSites) {
+        HIRBlock block = cfg.blockFor(node);
+        boolean loop = block != null && block.getLoop() != null;
+        String name = Names.simpleName(field.getField().format("%H")) + "." + field.getField().getName();
+        boolean store = node instanceof StoreFieldNode || node instanceof AbstractWriteNode;
+        Map<String, Integer> counted = store ? writes
+                        : node instanceof LoadFieldNode || node instanceof ReadNode || node instanceof FloatingReadNode ? reads : null;
+        if (counted != null) {
+            counted.merge(name + (loop ? "(loop)" : ""), 1, Integer::sum);
+            accessSites.add(String.join("\t", store ? "store" : "load", loop ? "loop" : "flat", name, position(node)));
         }
     }
 
@@ -305,18 +312,22 @@ final class CompiledCodeCounts {
                 callPlaces.add(position(node));
             }
         }
-        String hash = "0";
-        if (!inlined.isEmpty()) {
-            try {
-                byte[] digest = MessageDigest.getInstance("SHA-256").digest(String.join("\n", inlined).getBytes(StandardCharsets.UTF_8));
-                hash = String.format("%02x%02x%02x%02x", digest[0], digest[1], digest[2], digest[3]);
-            } catch (NoSuchAlgorithmException e) {
-                throw new IllegalStateException(e);
-            }
-        }
         return String.join("\t", Integer.toString(graph.getNodeCount()), Integer.toString(fixedNodes), Integer.toString(longestInBlocks), Integer.toString(longestInFixedNodes),
-                        Integer.toString(deepestLoop), Integer.toString(inlined.size()), hash, Integer.toString(ifPlaces.size()), Integer.toString(callPlaces.size()),
+                        Integer.toString(deepestLoop), Integer.toString(inlined.size()), inliningHash(inlined), Integer.toString(ifPlaces.size()), Integer.toString(callPlaces.size()),
                         Integer.toString(ifsWithoutPlace));
+    }
+
+    /** The first 8 hex digits of the SHA-256 of the inlined call sites, one a line; 0 for none. */
+    private static String inliningHash(TreeSet<String> inlined) {
+        if (inlined.isEmpty()) {
+            return "0";
+        }
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(String.join("\n", inlined).getBytes(StandardCharsets.UTF_8));
+            return String.format("%02x%02x%02x%02x", digest[0], digest[1], digest[2], digest[3]);
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
     }
 
     /**
@@ -336,6 +347,7 @@ final class CompiledCodeCounts {
         return chain.toString();
     }
 
+    /** Counted accesses for counts.txt: each field, with how many when more than one; - for none. */
     private static String show(Map<String, Integer> counted) {
         return counted.isEmpty() ? "-"
                         : counted.entrySet().stream().map(e -> e.getKey() + (e.getValue() > 1 ? "\u00d7" + e.getValue() : "")).collect(Collectors.joining(" "));
