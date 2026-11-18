@@ -67,6 +67,7 @@ final class KillSets {
      * The VM's state every narrowed call kills.
      */
     private final List<LocationIdentity> vmState = new ArrayList<>();
+    /** How many lines kills.txt has, for timings.txt. */
     private long methodsWithFacts;
 
     /**
@@ -97,6 +98,7 @@ final class KillSets {
         written.put(method, List.of());
     }
 
+    /** How many methods the tool's answer has a line for, any included. */
     long methodsWithFacts() {
         return methodsWithFacts;
     }
@@ -120,6 +122,7 @@ final class KillSets {
         return vm ? vmState : List.of();
     }
 
+    /** Whether a location is the VM's state that every narrowed call kills. */
     boolean isVMState(LocationIdentity location) {
         return vmState.contains(location);
     }
@@ -188,6 +191,7 @@ final class KillSets {
         };
     }
 
+    /** The class of a primitive type by its name, for an array partition. */
     private static Class<?> primitive(String name) {
         return switch (name) {
             case "char" -> char.class;

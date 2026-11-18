@@ -73,6 +73,7 @@ final class FieldPartitions {
         }
     }
 
+    /** Whether no access has a partition, as when objects are not told apart. */
     boolean isEmpty() {
         return located.isEmpty();
     }
@@ -93,11 +94,11 @@ final class FieldPartitions {
         for (Map.Entry<String, List<AccessFieldNode>> field : byField.entrySet()) {
             List<String> partitions = new ArrayList<>();
             for (AccessFieldNode access : field.getValue()) {
-                String at = PointsToExport.position(access.getNodeSourcePosition());
-                String found = at == null || access.getLocationIdentity().isImmutable() || access.ordersMemoryAccesses() ? null
-                                : Names.sitesOf(at).stream().map(site -> located.get(site + "\t" + field.getKey())).filter(Objects::nonNull).findFirst().orElse(null);
+                String found = partitionOf(access, field.getKey());
                 partitions.add(found == null || !split ? found : found + "#" + reference(access));
             }
+            // An access without a partition keeps the whole field for all of them; so does a
+            // field whose partition is the whole field everywhere.
             if (partitions.contains(null) || partitions.stream().allMatch(field.getKey()::equals)) {
                 continue;
             }
@@ -109,6 +110,18 @@ final class FieldPartitions {
                             new TreeSet<>(partitions).stream().map(p -> p.contains("@") ? p.substring(p.indexOf('@')) : p).collect(Collectors.joining(" "))));
         }
         return partitioned;
+    }
+
+    /**
+     * The partition the tool gives an access, by the first of its sites it names; null for an
+     * access without a position, one that never changes, and a volatile one.
+     */
+    private String partitionOf(AccessFieldNode access, String field) {
+        String at = PointsToExport.position(access.getNodeSourcePosition());
+        if (at == null || access.getLocationIdentity().isImmutable() || access.ordersMemoryAccesses()) {
+            return null;
+        }
+        return Names.sitesOf(at).stream().map(site -> located.get(site + "\t" + field)).filter(Objects::nonNull).findFirst().orElse(null);
     }
 
     /**

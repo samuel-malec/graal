@@ -25,6 +25,7 @@
 package com.oracle.svm.hosted.sideeffects;
 
 import java.io.IOException;
+import java.io.PrintStream;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -207,6 +208,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
     private final FieldPartitions partitions = new FieldPartitions(Options.SideEffectAnalysisClaimNoAliasing.getValue());
     private final LockElision lockElision = new LockElision(Options.SideEffectAnalysisClaimLocksLocal.getValue(), Options.SideEffectAnalysisClaimNoDeoptimization.getValue());
     private final CompiledCodeCounts counts = new CompiledCodeCounts(program);
+    /** The size of export.json, for timings.txt; 0 if none was written. */
     private long exportBytes;
     /** For how many methods the build's kill sets were found equal to the tool's; -1 if not compared. */
     private int killSetsCompared = -1;
@@ -260,30 +262,40 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
     private List<String> export(FeatureImpl.AfterAnalysisAccessImpl access, Path export) throws IOException {
         long start = System.nanoTime();
         String assumptions = Options.SideEffectAnalysisAssumptions.getValue();
-        if (!threadEscape && (elideLocks || !assumptions.isEmpty() || !Options.SideEffectAnalysisClaimLocksLocal.getValue().isEmpty())) {
-            throw UserError.abort("-H:-SideEffectAnalysisThreadEscape leaves out what -H:+SideEffectAnalysisElideLocks, -H:SideEffectAnalysisAssumptions and -H:SideEffectAnalysisClaimLocksLocal need");
-        }
-        if (!List.of("tool", "build", "both").contains(killSetsBy)) {
-            throw UserError.abort("-H:SideEffectAnalysisKillSets is tool, build or both, not %s", killSetsBy);
-        }
         boolean inBuild = narrow && !killSetsBy.equals("tool");
-        if (inBuild && (!partition.equals("field") || !ignoredEffects.isEmpty())) {
-            throw UserError.abort("-H:SideEffectAnalysisKillSets=%s partitions by field and leaves no effect out: -H:SideEffectAnalysisPartition and -H:SideEffectAnalysisIgnoreEffects need the tool",
-                            killSetsBy);
-        }
+        checkOptions(assumptions, inBuild);
         boolean written = !(narrow && killSetsBy.equals("build")) || elideLocks || graphs;
         if (!written) {
             // Not this build's: nothing may read an export an earlier build left here.
             Files.deleteIfExists(export);
         }
         Set<String> assumed = assumptions.isEmpty() ? PointsToExport.defaultAssumptions() : Set.of(assumptions.split(","));
-        List<String> worked = PointsToExport.export((PointsToAnalysis) access.getBigBang(), access.getUniverse(), written && !graphs ? export.toString() : "",
-                        written && graphs ? export.toString() : "", null, true, program, threadEscape, assumed, inBuild);
+        // The export goes to one of two paths, by whether it holds the graphs too; "" writes none.
+        String factsOnly = written && !graphs ? export.toString() : "";
+        String withGraphs = written && graphs ? export.toString() : "";
+        PrintStream report = null; // the export's summary is not printed
+        boolean compiled = true; // the image is compiled after this, so a call without targets never runs
+        List<String> worked = PointsToExport.export((PointsToAnalysis) access.getBigBang(), access.getUniverse(), factsOnly, withGraphs, report, compiled, program, threadEscape, assumed, inBuild);
         PointsToExport.stopRecording((PointsToAnalysis) access.getBigBang());
         times.time("export", start);
         PointsToExport.STEP_NANOS.forEach((step, stepNanos) -> times.add("export: " + step, stepNanos));
         exportBytes = written ? Files.size(export) : 0;
         return worked;
+    }
+
+    /** Stops the build on options that don't go together. */
+    private void checkOptions(String assumptions, boolean inBuild) {
+        if (!threadEscape && (elideLocks || !assumptions.isEmpty() || !Options.SideEffectAnalysisClaimLocksLocal.getValue().isEmpty())) {
+            throw UserError.abort(
+                            "-H:-SideEffectAnalysisThreadEscape leaves out what -H:+SideEffectAnalysisElideLocks, -H:SideEffectAnalysisAssumptions and -H:SideEffectAnalysisClaimLocksLocal need");
+        }
+        if (!List.of("tool", "build", "both").contains(killSetsBy)) {
+            throw UserError.abort("-H:SideEffectAnalysisKillSets is tool, build or both, not %s", killSetsBy);
+        }
+        if (inBuild && (!partition.equals("field") || !ignoredEffects.isEmpty())) {
+            throw UserError.abort("-H:SideEffectAnalysisKillSets=%s partitions by field and leaves no effect out: -H:SideEffectAnalysisPartition and -H:SideEffectAnalysisIgnoreEffects need the tool",
+                            killSetsBy);
+        }
     }
 
     /** Runs effects.elide on the export, and reads the monitors and volatile accesses it says can go. */
@@ -394,6 +406,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         }
     }
 
+    /** Stops a process and every process it started. */
     private static void stopTree(Process tool) {
         tool.descendants().forEach(ProcessHandle::destroyForcibly);
         tool.destroyForcibly();
@@ -413,16 +426,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
                  * and stores that inlining brings into a method get the analysis too. Before them
                  * only canonicalization runs, which no kill set changes.
                  */
-                List<Phase> phases = new ArrayList<>();
-                if (narrow) {
-                    phases.add(new ApplySideEffectAnalysisPhase(times, killSets, partitions, program, only, skip, counts));
-                    if (overwrittenStores) {
-                        phases.add(new EliminateOverwrittenStoresPhase(times, program, counts));
-                    }
-                }
-                if (elideLocks) {
-                    phases.add(lockElision.newPhase(times, counts));
-                }
+                List<Phase> phases = highTierPhases();
                 ListIterator<BasePhase<? super HighTierContext>> afterInlining = suites.getHighTier().findPhase(RemoveUnwindPhase.class);
                 if (afterInlining != null) {
                     phases.forEach(afterInlining::add);
@@ -438,29 +442,50 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         }
     }
 
+    /** The phases that go after the inliners, in order: applying the analysis, the overwritten stores, the locks. */
+    private List<Phase> highTierPhases() {
+        List<Phase> phases = new ArrayList<>();
+        if (narrow) {
+            phases.add(new ApplySideEffectAnalysisPhase(times, killSets, partitions, program, only, skip, counts));
+            if (overwrittenStores) {
+                phases.add(new EliminateOverwrittenStoresPhase(times, program, counts));
+            }
+        }
+        if (elideLocks) {
+            phases.add(lockElision.newPhase(times, counts));
+        }
+        return phases;
+    }
+
     @Override
     public void afterCompilation(AfterCompilationAccess access) {
         try {
             Files.createDirectories(out);
             counts.write(out, label);
-            StringBuilder timings = new StringBuilder("# step\tseconds\truns (the export and the tool once, a phase once per graph, summed over the compiler's threads)\n");
-            times.appendTo(timings);
-            timings.append(String.format("# export.json: %d bytes, %d methods with facts%n", exportBytes, killSets.methodsWithFacts()));
-            if (killSetsCompared >= 0) {
-                timings.append(String.format("# kill sets worked out in the build: the tool's for all %d methods%n", killSetsCompared));
-            }
-            if (!ignoredEffects.isEmpty()) {
-                timings.append(String.format("# the kill of %s is left out of the kill sets: an upper bound, not sound%n", ignoredEffects));
-            }
-            if (elideLocks) {
-                lockElision.appendTo(timings);
-            }
-            Files.writeString(out.resolve("timings.txt"), timings);
+            Files.writeString(out.resolve("timings.txt"), timings());
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
     }
 
+    /** What timings.txt says: each step's cost, then notes on the export, the kill sets and the locks. */
+    private StringBuilder timings() {
+        StringBuilder timings = new StringBuilder("# step\tseconds\truns (the export and the tool once, a phase once per graph, summed over the compiler's threads)\n");
+        times.appendTo(timings);
+        timings.append(String.format("# export.json: %d bytes, %d methods with facts%n", exportBytes, killSets.methodsWithFacts()));
+        if (killSetsCompared >= 0) {
+            timings.append(String.format("# kill sets worked out in the build: the tool's for all %d methods%n", killSetsCompared));
+        }
+        if (!ignoredEffects.isEmpty()) {
+            timings.append(String.format("# the kill of %s is left out of the kill sets: an upper bound, not sound%n", ignoredEffects));
+        }
+        if (elideLocks) {
+            lockElision.appendTo(timings);
+        }
+        return timings;
+    }
+
+    /** The prefixes a comma-separated option lists; none for an empty one. */
     private static List<String> prefixes(String commaSeparated) {
         return Arrays.stream(commaSeparated.split(",")).filter(prefix -> !prefix.isEmpty()).toList();
     }

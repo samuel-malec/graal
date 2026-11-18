@@ -58,5 +58,6 @@ abstract class TimedPhase extends Phase {
         }
     }
 
+    /** What the phase does to a graph. */
     protected abstract void runOn(StructuredGraph graph);
 }

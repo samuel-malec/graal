@@ -117,9 +117,16 @@ final class PublishingSites {
         }
     }
 
+    /** An object passed to a call that links its arguments: in the argument at the position. */
     record Link(Call call, int position) {
     }
 
+    /** The natives of Object and of Class that store no reference, for {@link #isPure}. */
+    private static final Set<String> PURE_OBJECT = Set.of("getClass", "hashCode", "notify", "notifyAll", "wait0", "wait");
+    private static final Set<String> PURE_CLASS = Set.of("isInstance", "isAssignableFrom", "isInterface", "isArray", "isPrimitive", "isHidden", "isRecord", "isAnnotation", "isEnum", "getModifiers",
+                    "getSuperclass", "getComponentType", "getName", "desiredAssertionStatus");
+
+    // Taken from the thread escape these sites are for.
     private final ThreadEscape escape;
     private final PointsToAnalysis bb;
     private final AnalysisUniverse universe;
@@ -132,27 +139,33 @@ final class PublishingSites {
     StoredPlaces places;
     SharingExplanation why;
 
+    /** How well the facts describe each method. */
     final Function<AnalysisMethod, Described> described;
 
     /** Whether the graphs are about to be compiled, so that a call without targets never happens. */
     final boolean compiled;
 
+    /** What the export found that the flows don't show: stores the analysis models by nothing, calls to code it can't see. */
     final List<UnsafeStore> unsafeStores;
     final List<OpaqueCall> opaqueCalls;
+
+    /** The sites made, not yet put under the objects they may go into: see {@link #register}. */
     final List<PendingSite> pendingSites = new ArrayList<>();
+
+    /** The sites by the objects they may go into. */
     final Map<AnalysisObject, List<Site>> sitesByObject = new HashMap<>();
 
     /** The sites that may go into any object of a type: their flow saturated. */
     final Map<AnalysisType, List<Site>> sitesByType = new HashMap<>();
 
-    int storeSites;
-    int copySites;
+    /** The calls that link their arguments, by the objects passed to them, and by the types of saturated arguments. */
     final Map<AnalysisObject, List<Link>> links = new HashMap<>();
     final Map<AnalysisType, List<Link>> linksByType = new HashMap<>();
+
+    // How many sites and linking calls there are, for the diagnostics.
+    int storeSites;
+    int copySites;
     int linkedCalls;
-    private static final Set<String> PURE_OBJECT = Set.of("getClass", "hashCode", "notify", "notifyAll", "wait0", "wait");
-    private static final Set<String> PURE_CLASS = Set.of("isInstance", "isAssignableFrom", "isInterface", "isArray", "isPrimitive", "isHidden", "isRecord", "isAnnotation", "isEnum", "getModifiers",
-                    "getSuperclass", "getComponentType", "getName", "desiredAssertionStatus");
 
     PublishingSites(ThreadEscape escape, Function<AnalysisMethod, Described> described, boolean compiled, List<UnsafeStore> unsafeStores, List<OpaqueCall> opaqueCalls) {
         this.escape = escape;
@@ -169,6 +182,7 @@ final class PublishingSites {
         this.opaqueCalls = opaqueCalls;
     }
 
+    /** Gives the sites the parts of the thread escape made after them. */
     void connect(FlowReader reader, StoredPlaces places, SharingExplanation why) {
         this.reader = reader;
         this.places = places;
@@ -190,39 +204,18 @@ final class PublishingSites {
         if (flow instanceof StoreFieldTypeFlow.StoreStaticFieldTypeFlow store) {
             // Every thread reaches a static field.
             if (store.valueFlow() != null && !escape.isPrivate(store.field()) && !ThreadEscape.LEAVE_OUT.contains("static")) {
-                afterCollection.add(() -> {
-                    why.because(() -> "a store into the static field " + store.field().format("%H.%n") + " in " + method.format("%H.%n"), null);
-                    Held stored = reader.held(store.valueFlow(), true);
-                    if (explain != null && explain.matcher(store.field().format("%H.%n")).find()) {
-                        PointsToExport.diagnostics().println("THREADESCAPE a store into the static field " + store.field().format("%H.%n") + " shares " + why.describe(stored) + " " + why.summary(stored));
-                        for (FlowReader.Source source : stored.stored()) {
-                            if (source.key() instanceof TypeFlow<?> saturated) {
-                                Held rebuilt = reader.rebuild(saturated);
-                                PointsToExport.diagnostics().println("THREADESCAPE   the saturated " + GraphExport.simpleClassName(saturated) + " of declared type " + saturated.getDeclaredType() +
-                                                " (filters " + source.filters() + ") is rebuilt as " +
-                                                why.describe(rebuilt) + " " + why.summary(rebuilt));
-                            }
-                        }
-                    }
-                    escape.share(stored);
-                });
+                afterCollection.add(() -> shareStaticStore(method, store));
                 storeSites++;
             }
         } else if (flow instanceof StoreFieldTypeFlow.StoreInstanceFieldTypeFlow store && store.valueFlow() != null && !escape.isPrivate(store.field()) && !ThreadEscape.LEAVE_OUT.contains("field")) {
             site(Kind.STORE, () -> "a store into " + store.field().format("%H.%n") + " in " + method.format("%H.%n"), reader.observedBy(store, store.receiver()), store.valueFlow(), store.field());
         } else if (flow instanceof OffsetStoreTypeFlow store && store.valueFlow() != null && !isStoreApi(method) && !ThreadEscape.LEAVE_OUT.contains("array")) {
             boolean indexed = store instanceof OffsetStoreTypeFlow.StoreIndexedTypeFlow;
-            site(Kind.STORE, () -> "a " + (indexed ? "store into an array" : "unsafe store") + " in " + method.format("%H.%n"), reader.held(reader.observedBy(store, store.receiver()), true), reader.held(store.valueFlow(), true), null,
+            site(Kind.STORE, () -> "a " + (indexed ? "store into an array" : "unsafe store") + " in " + method.format("%H.%n"), reader.held(reader.observedBy(store, store.receiver()), true), reader
+                            .held(store.valueFlow(), true), null,
                             List.of(store.valueFlow()), !indexed, true);
-            if (!(store instanceof OffsetStoreTypeFlow.StoreIndexedTypeFlow) && !readFlows && !bb.analysisPolicy().useConservativeUnsafeAccess() && !universe.getUnsafeAccessedStaticFields().isEmpty()) {
-                // The analysis lets an unsafe store write a static field, whatever the object it stores into; its base is the array that holds statics.
-                Held base = reader.held(reader.observedBy(store, store.receiver()), true);
-                if (base.isNothing() || !base.any().isEmpty() || FlowReader.hasArray(base.objectsIn(bb))) {
-                    afterCollection.add(() -> {
-                        why.because(() -> "an unsafe store in " + method.format("%H.%n") + ", which may write a static field", null);
-                        escape.share(reader.held(store.valueFlow(), true));
-                    });
-                }
+            if (!indexed && !readFlows && !bb.analysisPolicy().useConservativeUnsafeAccess() && !universe.getUnsafeAccessedStaticFields().isEmpty()) {
+                unsafeStoreIntoStatics(method, store);
             }
         } else if (flow instanceof ArrayCopyTypeFlow copy && !ThreadEscape.LEAVE_OUT.contains("copy")) {
             site(Kind.COPY, () -> "a copy between arrays in " + method.format("%H.%n"), copy.destination(), copy.source(), null);
@@ -232,11 +225,47 @@ final class PublishingSites {
         }
     }
 
+    /** A store into a static field shares what it stores, which every thread reaches. */
+    private void shareStaticStore(AnalysisMethod method, StoreFieldTypeFlow.StoreStaticFieldTypeFlow store) {
+        why.because(() -> "a store into the static field " + store.field().format("%H.%n") + " in " + method.format("%H.%n"), null);
+        Held stored = reader.held(store.valueFlow(), true);
+        if (explain != null && explain.matcher(store.field().format("%H.%n")).find()) {
+            PointsToExport.diagnostics().println("THREADESCAPE a store into the static field " + store.field().format("%H.%n") + " shares " + why.describe(stored) + " " + why.summary(stored));
+            for (FlowReader.Source source : stored.stored()) {
+                if (source.key() instanceof TypeFlow<?> saturated) {
+                    Held rebuilt = reader.rebuild(saturated);
+                    PointsToExport.diagnostics().println("THREADESCAPE   the saturated " + GraphExport.simpleClassName(saturated) + " of declared type " + saturated.getDeclaredType() +
+                                    " (filters " + source.filters() + ") is rebuilt as " +
+                                    why.describe(rebuilt) + " " + why.summary(rebuilt));
+                }
+            }
+        }
+        escape.share(stored);
+    }
+
+    /**
+     * The analysis lets an unsafe store write a static field, whatever the object it stores into;
+     * the base of such a store is the array that holds statics. A store whose base may be that
+     * array shares what it stores.
+     */
+    private void unsafeStoreIntoStatics(AnalysisMethod method, OffsetStoreTypeFlow store) {
+        Held base = reader.held(reader.observedBy(store, store.receiver()), true);
+        if (base.isNothing() || !base.any().isEmpty() || FlowReader.hasArray(base.objectsIn(bb))) {
+            afterCollection.add(() -> {
+                why.because(() -> "an unsafe store in " + method.format("%H.%n") + ", which may write a static field", null);
+                escape.share(reader.held(store.valueFlow(), true));
+            });
+        }
+    }
+
     private void site(Kind kind, Supplier<String> what, TypeFlow<?> into, TypeFlow<?> value, AnalysisField field) {
         site(kind, what, reader.held(into, true), reader.held(value, true), field, List.of(value), false, true);
     }
 
     /**
+     * Makes a site of a store, a copy or a clone, and records what a store stores under the place
+     * it stores into, for the saturated loads that read from there.
+     *
      * @param unsafe whether the store is an unsafe or a handle's, which may be into a field
      * @param array whether it is into an array for sure; otherwise whether it may be
      */
@@ -255,14 +284,16 @@ final class PublishingSites {
                     why.arrayStoresOfAny.add(what.get() + "  stores " + why.summary(stored));
                 }
             }
-            if (field == null && !isArrayStore || field == null && unsafe) {
+            if (field == null && (!isArrayStore || unsafe)) {
+                // It may be into a field accessed through unsafe.
                 places.storedUnsafely.add(stored);
             }
         }
         if (explain != null) {
             site.flows = flows;
             if (explain.matcher(what.get()).find()) {
-                PointsToExport.diagnostics().println("THREADESCAPE site (" + kind + ") " + what.get() + "\n    into " + why.describe(target) + " " + why.summary(target) + "\n    value " + why.describe(stored) + " " + why.summary(stored));
+                PointsToExport.diagnostics().println("THREADESCAPE site (" + kind + ") " + what.get() + "\n    into " + why.describe(target) + " " + why.summary(target) + "\n    value " + why
+                                .describe(stored) + " " + why.summary(stored));
             }
         }
         if (kind == Kind.STORE) {
@@ -284,7 +315,8 @@ final class PublishingSites {
                     names.append(GraphExport.PointsTo.objectName(object)).append("; ");
                 }
             }
-            PointsToExport.diagnostics().println("THREADESCAPE registered " + site.what.get() + " into " + count + " objects: " + names + " any " + target.any().stream().map(AnalysisType::toJavaName).toList() + " from " + why.summary(rawTarget));
+            PointsToExport.diagnostics().println("THREADESCAPE registered " + site.what.get() + " into " + count + " objects: " + names + " any " + target.any().stream().map(AnalysisType::toJavaName)
+                            .toList() + " from " + why.summary(rawTarget));
         }
         for (AnalysisObject object : target.objectsIn(bb)) {
             if (site.kind != Kind.CLONE && object.isEmptyObjectArrayConstant(bb)) {
@@ -372,15 +404,19 @@ final class PublishingSites {
     private void shareOpaqueCall(AnalysisMethod caller, InvokeTypeFlow invoke, AnalysisMethod culprit) {
         for (TypeFlow<?> argument : invoke.getActualParameters()) {
             if (argument != null) {
-                why.because(() -> "argument of a call in " + caller.format("%H.%n") + " to " + (culprit == null ? "a method without targets" : culprit.format("%H.%n") + ", which the facts don't have") +
-                                (argument.isSaturated() ? " (saturated flow)" : ""), null);
+                why.because(() -> "argument of a call in " + caller.format("%H.%n") + " to " + opaqueCallee(culprit) + (argument.isSaturated() ? " (saturated flow)" : ""), null);
                 escape.share(reader.held(argument, true));
             }
         }
         if (invoke.getActualReturn() != null) {
-            why.because(() -> "result of a call in " + caller.format("%H.%n") + " to " + (culprit == null ? "a method without targets" : culprit.format("%H.%n") + ", which the facts don't have"), null);
+            why.because(() -> "result of a call in " + caller.format("%H.%n") + " to " + opaqueCallee(culprit), null);
             escape.share(reader.held(invoke.getActualReturn(), true));
         }
+    }
+
+    /** The callee of a call the facts know nothing of, for the explanation. */
+    private static String opaqueCallee(AnalysisMethod culprit) {
+        return culprit == null ? "a method without targets" : culprit.format("%H.%n") + ", which the facts don't have";
     }
 
     /** A call to a method with an effect the facts can't name: the objects of different arguments are linked. */
@@ -504,6 +540,7 @@ final class PublishingSites {
         }
     }
 
+    /** An object passed to a linking call is shared: the objects of the call's other arguments are, once each. */
     void spread(Link link, AnalysisObject object) {
         Call call = link.call();
         for (int other = 0; other < call.arguments.size(); other++) {

@@ -136,25 +136,22 @@ import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
 
 /**
- * Exports a method's Graal IR, scheduled, with what the points-to analysis says of its values; and
- * the names the export gives methods, fields, classes and objects, and the JSON it writes them as.
+ * Exports a method's Graal IR, scheduled, with what the points-to analysis says of its values.
  */
 final class GraphExport {
 
     private GraphExport() {
     }
 
-    /**
-     * A node's id, the one IGV shows, so that the export and a dump of the same graph name its
-     * nodes alike. Graal deprecates it because an id changes when a node is deleted or its graph
-     * is compressed; the export reads ids only once its graph is final, as Graal's own printer
-     * does ({@code BinaryGraphPrinter.getNodeId}).
-     */
     @SuppressWarnings("deprecation")
     static int nodeId(Node node) {
         return node.getId();
     }
 
+    /**
+     * A method's entry in the export: its name and descriptor, its blocks in reverse post order, the
+     * values its ops name, and what it has that the export can't express.
+     */
     @SuppressWarnings("try")
     static Map<String, Object> export(PointsToAnalysis bb, PointsToAnalysisMethod method, ObjectNames objectNames) {
         Map<String, Object> out = new LinkedHashMap<>();
@@ -203,12 +200,19 @@ final class GraphExport {
         return out;
     }
 
-    /** A hidden class's address in its name, Foo$$Lambda/0x00000000a455d0c8, or .0x... in a descriptor. */
+    /**
+     * A hidden class's address in its name, Foo$$Lambda/0x00000000a455d0c8, or .0x... in a descriptor.
+     */
     private static final Pattern HIDDEN_ADDRESS = Pattern.compile("(?<=[./])0x[0-9a-f]{8,16}");
 
-    /** Each hidden class's address, and what the export names it instead. */
+    /**
+     * Each hidden class's address, and what the export names it instead.
+     */
     private static final Map<String, String> HIDDEN = new ConcurrentHashMap<>();
 
+    /**
+     * Names each hidden class by a hash of its code, which is the same in every run, and reports how many there are.
+     */
     static void nameHiddenClasses(Collection<AnalysisType> types, PrintStream report) {
         HIDDEN.clear();
         Map<String, Integer> named = new HashMap<>();
@@ -222,10 +226,12 @@ final class GraphExport {
         }
         long shared = named.values().stream().filter(n -> n > 1).count();
         report.println(HIDDEN.size() + " hidden classes named by their code" + (shared == 0 ? ""
-                        : ", " + shared + " names shared by classes with the same code"));
+                : ", " + shared + " names shared by classes with the same code"));
     }
 
-    /** A name as the JVM gives it, with each hidden class's address replaced: see {@link #nameHiddenClasses}. */
+    /**
+     * A name as the JVM gives it, with each hidden class's address replaced: see {@link #nameHiddenClasses}.
+     */
     static String stable(String name) {
         if (HIDDEN.isEmpty() || !name.contains("0x")) {
             return name;
@@ -238,7 +244,9 @@ final class GraphExport {
         return address.appendTail(named).toString();
     }
 
-    /** What a class is, as 16 hex digits: see {@link #nameHiddenClasses}. */
+    /**
+     * What a class is, as 16 hex digits: see {@link #nameHiddenClasses}.
+     */
     private static String contentHash(ResolvedJavaType type) {
         StringBuilder what = new StringBuilder();
         for (ResolvedJavaType i : type.getInterfaces()) {
@@ -262,7 +270,7 @@ final class GraphExport {
             for (BytecodeStream stream = new BytecodeStream(code); stream.currentBCI() < stream.endBCI(); stream.next()) {
                 int opcode = stream.currentBC();
                 if (opcode == Bytecodes.INVOKEVIRTUAL || opcode == Bytecodes.INVOKESPECIAL || opcode == Bytecodes.INVOKESTATIC
-                                || opcode == Bytecodes.INVOKEINTERFACE || opcode == Bytecodes.INVOKEDYNAMIC) {
+                        || opcode == Bytecodes.INVOKEINTERFACE || opcode == Bytecodes.INVOKEDYNAMIC) {
                     int cpi = opcode == Bytecodes.INVOKEDYNAMIC ? stream.readCPI4() : stream.readCPI();
                     what.append(' ').append(method.getConstantPool().lookupMethod(cpi, opcode, method).format("%H.%n(%P)%R"));
                 }
@@ -277,8 +285,13 @@ final class GraphExport {
         }
     }
 
+    /**
+     * The names of the objects constants hold, one name for each object, unique in the export.
+     */
     static final class ObjectNames {
-        /** How many characters of a string its name shows. */
+        /**
+         * How many characters of a string its name shows.
+         */
         private static final int SHOWN = 40;
 
         private final PointsToAnalysis bb;
@@ -289,7 +302,9 @@ final class GraphExport {
             this.bb = bb;
         }
 
-        /** The name of the object a constant node holds. */
+        /**
+         * The name of the object a constant node holds.
+         */
         String name(ConstantNode node, JavaConstant object) {
             return names.computeIfAbsent(object, o -> {
                 String known = known(node, o);
@@ -297,7 +312,9 @@ final class GraphExport {
             });
         }
 
-        /** What a string, a class or the value of a static final field is known by; null for any other object. */
+        /**
+         * What a string, a class or the value of a static final field is known by; null for any other object.
+         */
         private String known(ConstantNode node, JavaConstant object) {
             if (object instanceof ImageHeapConstant heap && heap.isBackedByHostedObject() && heap.getType().getJavaClass() == String.class) {
                 String text = heap.toValueString();
@@ -316,12 +333,14 @@ final class GraphExport {
             return field == null ? null : fieldName(field);
         }
 
-        /** The name if no object has it yet, else the name with the first number no object has. */
+        /**
+         * The name if no object has it yet, else the name with the first number no object has.
+         */
         private String free(String name, boolean numbered) {
             if (!numbered && taken.add(name)) {
                 return name;
             }
-            for (int i = numbered ? 1 : 2;; i++) {
+            for (int i = numbered ? 1 : 2; ; i++) {
                 if (taken.add(name + "#" + i)) {
                     return name + "#" + i;
                 }
@@ -350,7 +369,9 @@ final class GraphExport {
         }
     }
 
-    /** The graph the analysis built the method's flows from, null for a method without a body. */
+    /**
+     * The graph the analysis built the method's flows from, null for a method without a body.
+     */
     @SuppressWarnings("try")
     static StructuredGraph analysisGraph(PointsToAnalysis bb, PointsToAnalysisMethod method) {
         AnalysisParsedGraph parsed = method.ensureGraphParsed(bb);
@@ -366,6 +387,9 @@ final class GraphExport {
         return graph;
     }
 
+    /**
+     * What the points-to analysis says a method's values may be.
+     */
     static final class PointsTo {
         private final PointsToAnalysis bb;
         private final PointsToAnalysisMethod method;
@@ -383,7 +407,9 @@ final class GraphExport {
             }
         }
 
-        /** What a field or array access may touch: a static field's is its class's statics. */
+        /**
+         * What a field or array access may touch: a static field's is its class's statics.
+         */
         List<String> receivers(Node access) {
             if (access instanceof AccessFieldNode field) {
                 return field.isStatic() ? List.of(typeName(field.field().getDeclaringClass()) + ".<statics>") : objects(field.object());
@@ -397,24 +423,12 @@ final class GraphExport {
          * no flow was made for.
          */
         List<TypeFlow<?>> flowsOf(ValueNode reference) {
-            List<TypeFlow<?>> found = new ArrayList<>();
-            Deque<ValueNode> work = new ArrayDeque<>(List.of(reference));
-            Set<ValueNode> seen = new HashSet<>();
-            while (!work.isEmpty()) {
-                ValueNode value = GraphUtil.unproxify(work.pop());
-                if (!seen.add(value) || value.isNullConstant()) {
-                    continue;
-                }
-                if (value instanceof ValuePhiNode phi) {
-                    phi.values().forEach(work::push);
-                    continue;
-                }
-                List<TypeFlow<?>> sources = sources(value);
-                if (sources.isEmpty()) {
-                    return null;
-                }
-                found.addAll(sources);
+            List<List<TypeFlow<?>>> behind = sourcesBehind(reference);
+            if (behind == null) {
+                return null;
             }
+            List<TypeFlow<?>> found = new ArrayList<>();
+            behind.forEach(found::addAll);
             return found;
         }
 
@@ -423,22 +437,12 @@ final class GraphExport {
          * null if the analysis can't name them: a flow saturated, or none was made for the value.
          */
         List<String> objects(ValueNode reference) {
+            List<List<TypeFlow<?>>> behind = sourcesBehind(reference);
+            if (behind == null) {
+                return null;
+            }
             TreeSet<String> names = new TreeSet<>();
-            Deque<ValueNode> work = new ArrayDeque<>(List.of(reference));
-            Set<ValueNode> seen = new HashSet<>();
-            while (!work.isEmpty()) {
-                ValueNode value = GraphUtil.unproxify(work.pop());
-                if (!seen.add(value) || value.isNullConstant()) {
-                    continue;
-                }
-                if (value instanceof ValuePhiNode phi) {
-                    phi.values().forEach(work::push);
-                    continue;
-                }
-                List<TypeFlow<?>> sources = sources(value);
-                if (sources.isEmpty()) {
-                    return null;
-                }
+            for (List<TypeFlow<?>> sources : behind) {
                 for (TypeFlow<?> source : sources) {
                     TypeState state = fold(source);
                     if (state == null) {
@@ -452,6 +456,37 @@ final class GraphExport {
             return new ArrayList<>(names);
         }
 
+        /**
+         * The flows of each value a reference may be, through phis and proxies, leaving out the
+         * null constant: one list for each value, in the order the walk meets them; null if a
+         * value comes from something no flow was made for.
+         */
+        private List<List<TypeFlow<?>>> sourcesBehind(ValueNode reference) {
+            List<List<TypeFlow<?>>> behind = new ArrayList<>();
+            Deque<ValueNode> work = new ArrayDeque<>(List.of(reference));
+            Set<ValueNode> seen = new HashSet<>();
+            while (!work.isEmpty()) {
+                ValueNode value = GraphUtil.unproxify(work.pop());
+                if (!seen.add(value) || value.isNullConstant()) {
+                    continue;
+                }
+                if (value instanceof ValuePhiNode phi) {
+                    phi.values().forEach(work::push);
+                    continue;
+                }
+                List<TypeFlow<?>> sources = sources(value);
+                if (sources.isEmpty()) {
+                    return null;
+                }
+                behind.add(sources);
+            }
+            return behind;
+        }
+
+        /**
+         * The flows the analysis made for a value: a parameter's, or those at the value's position
+         * that make, load or return it.
+         */
         private List<TypeFlow<?>> sources(ValueNode value) {
             List<TypeFlow<?>> found = new ArrayList<>();
             if (value instanceof ParameterNode parameter) {
@@ -462,11 +497,11 @@ final class GraphExport {
                 return found;
             }
             NodeSourcePosition position = value.getNodeSourcePosition();
-            for (TypeFlow<?> flow : position == null ? List.<TypeFlow<?>> of() : bySource.getOrDefault(position, List.of())) {
+            for (TypeFlow<?> flow : position == null ? List.<TypeFlow<?>>of() : bySource.getOrDefault(position, List.of())) {
                 boolean source = value instanceof LoadFieldNode load ? flow instanceof LoadFieldTypeFlow f && f.field().equals(load.field())
-                                : value instanceof LoadIndexedNode ? flow instanceof LoadIndexedTypeFlow
-                                : value instanceof AbstractNewObjectNode || value instanceof AllocatedObjectNode ? flow instanceof NewInstanceTypeFlow
-                                : value instanceof ConstantNode && flow instanceof ConstantTypeFlow;
+                        : value instanceof LoadIndexedNode ? flow instanceof LoadIndexedTypeFlow
+                        : value instanceof AbstractNewObjectNode || value instanceof AllocatedObjectNode ? flow instanceof NewInstanceTypeFlow
+                        : value instanceof ConstantNode && flow instanceof ConstantTypeFlow;
                 if (source) {
                     found.add(flow);
                 } else if (value instanceof Invoke && flow instanceof InvokeTypeFlow invoke && invoke.getActualReturn() != null) {
@@ -476,7 +511,9 @@ final class GraphExport {
             return found;
         }
 
-        /** The flow's state over every context, null if it saturated in any; a disabled flow, in code the analysis never reached, holds nothing. */
+        /**
+         * The flow's state over every context, null if it saturated in any; a disabled flow, in code the analysis never reached, holds nothing.
+         */
         private TypeState fold(TypeFlow<?> original) {
             if (original.isSaturated()) {
                 return null;
@@ -521,8 +558,11 @@ final class GraphExport {
         }
     }
 
+    /**
+     * A block: its predecessors, its scheduled nodes, its ops, its successors and how it ends.
+     */
     private static Map<String, Object> exportBlock(HIRBlock block, StructuredGraph.ScheduleResult schedule,
-                    Map<String, List<InvokeTypeFlow>> flowsByBci, PointsTo pointsTo, ObjectNames objectNames, Map<String, String> values, List<String> unsupported) {
+                                                   Map<String, List<InvokeTypeFlow>> flowsByBci, PointsTo pointsTo, ObjectNames objectNames, Map<String, String> values, List<String> unsupported) {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("id", block.getId());
 
@@ -588,7 +628,7 @@ final class GraphExport {
      * not. Anything else is recorded in {@code unsupported}.
      */
     private static Map<String, Object> exportNode(FixedNode node, Map<String, List<InvokeTypeFlow>> flowsByBci,
-                    Map<String, String> values, List<String> unsupported) {
+                                                  Map<String, String> values, List<String> unsupported) {
         if (node instanceof Invoke invoke) {
             return exportInvoke(invoke, flowsByBci);
         }
@@ -619,6 +659,9 @@ final class GraphExport {
         return null;
     }
 
+    /**
+     * An invoke's op: its target, and the callees the analysis found, or why it found none.
+     */
     private static Map<String, Object> exportInvoke(Invoke invoke, Map<String, List<InvokeTypeFlow>> flowsByBci) {
         Map<String, Object> op = new LinkedHashMap<>();
         op.put("kind", "invoke");
@@ -650,16 +693,22 @@ final class GraphExport {
         return op;
     }
 
+    /**
+     * Whether a scheduled node goes into the export's nodes: not the control flow's begins and ends, frame and virtual object states, or call targets.
+     */
     private static boolean isScheduledValueOrEffect(Node node) {
         if (node instanceof ExceptionObjectNode) {
             return true;
         }
         return !(node instanceof AbstractBeginNode || node instanceof AbstractEndNode || node instanceof VirtualState ||
-                        node instanceof MethodCallTargetNode);
+                node instanceof MethodCallTargetNode);
     }
 
+    /**
+     * A scheduled node: its id, op, type and inputs, and what its kind of node says.
+     */
     private static Map<String, Object> exportScheduledNode(Node node, ControlFlowGraph cfg, Map<String, List<InvokeTypeFlow>> flowsByBci, PointsTo pointsTo,
-                    ObjectNames objectNames) {
+                                                           ObjectNames objectNames) {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("id", nodeId(node));
         out.put("op", simpleClassName(node).replaceAll("Node$", ""));
@@ -758,6 +807,9 @@ final class GraphExport {
         return out;
     }
 
+    /**
+     * The kind of a node's value: ref, int, long, float, double, cond, or void.
+     */
     private static String typeOf(Node node) {
         if (node instanceof LogicNode) {
             return "cond";
@@ -778,6 +830,9 @@ final class GraphExport {
         return "void";
     }
 
+    /**
+     * Which way an if or a call with an exception edge goes to a successor; null for other ends.
+     */
     private static String edgeLabel(FixedNode end, AbstractBeginNode to) {
         if (end instanceof IfNode ifNode) {
             return to == ifNode.trueSuccessor() ? "true" : to == ifNode.falseSuccessor() ? "false" : null;
@@ -788,6 +843,9 @@ final class GraphExport {
         return null;
     }
 
+    /**
+     * How a block that ends the method ends: return, unwind, deopt, or the node's name.
+     */
     private static String exitKind(FixedNode end) {
         if (end instanceof ReturnNode) {
             return "return";
@@ -801,12 +859,18 @@ final class GraphExport {
         return simpleClassName(end);
     }
 
+    /**
+     * A value's id, past proxies, and its description recorded in {@code values}.
+     */
     private static int valueId(ValueNode value, Map<String, String> values) {
         ValueNode root = GraphUtil.unproxify(value);
         values.putIfAbsent(String.valueOf(nodeId(root)), describe(root));
         return nodeId(root);
     }
 
+    /**
+     * A short description of a value, for the export's values.
+     */
     private static String describe(ValueNode value) {
         if (value instanceof ParameterNode param) {
             return "param" + param.index();
@@ -826,16 +890,24 @@ final class GraphExport {
         return simpleClassName(value) + "#" + nodeId(value);
     }
 
+    /**
+     * Where in the bytecode a node comes from; -1 if nowhere.
+     */
     static int bci(ValueNode node) {
         NodeSourcePosition position = node.getNodeSourcePosition();
         return position == null ? -1 : position.getBCI();
     }
 
+    /**
+     * A method's class and name.
+     */
     static String methodName(ResolvedJavaMethod method) {
         return typeName(method.getDeclaringClass()) + "." + method.getName();
     }
 
-    /** A class's name, as the export writes it: see {@link #nameHiddenClasses}. */
+    /**
+     * A class's name, as the export writes it: see {@link #nameHiddenClasses}.
+     */
     static String typeName(ResolvedJavaType type) {
         return stable(type.toJavaName(true));
     }
@@ -852,7 +924,9 @@ final class GraphExport {
         return flows;
     }
 
-    /** The key of an invoke's flows in {@link #flows}. */
+    /**
+     * The key of an invoke's flows in {@link #flows}.
+     */
     static String flowKey(Invoke invoke) {
         return flowKey(flowBci(invoke), invoke.getTargetMethod());
     }
@@ -869,10 +943,12 @@ final class GraphExport {
             position = position.getCaller();
         }
         return position != null ? position.getBCI()
-                        : AbstractAnalysisEngine.syntheticSourcePosition(invoke.asFixedNode(), invoke.asFixedNode().graph().method()).getBCI();
+                : AbstractAnalysisEngine.syntheticSourcePosition(invoke.asFixedNode(), invoke.asFixedNode().graph().method()).getBCI();
     }
 
-    /** An array element's partition, by element kind: boolean[] and byte[] share one, and every reference array is Object[]. */
+    /**
+     * An array element's partition, by element kind: boolean[] and byte[] share one, and every reference array is Object[].
+     */
     static String arrayPartition(JavaKind kind) {
         return switch (kind) {
             case Boolean, Byte -> "byte[]";
@@ -881,16 +957,25 @@ final class GraphExport {
         };
     }
 
-    /** The name and the descriptor: what tells overloads apart. */
+    /**
+     * The name and the descriptor: what tells overloads apart.
+     */
     static String methodKey(ResolvedJavaMethod method) {
         // An indirect call, as Native Image makes for a C function, names no method.
         return method == null ? "<indirect>" : methodName(method) + stable(method.getSignature().toMethodDescriptor());
     }
 
+    /**
+     * A field's class and name.
+     */
     static String fieldName(ResolvedJavaField field) {
         return typeName(field.getDeclaringClass()) + "." + field.getName();
     }
 
+    /**
+     * A value as JSON, indented to the depth; a list of scalars, or a map of scalars and such lists,
+     * stays on one line.
+     */
     static String toJson(Object value, int depth) {
         StringBuilder sb = new StringBuilder();
         writeJson(sb, value, depth);
@@ -944,7 +1029,9 @@ final class GraphExport {
         out.write(']');
     }
 
-    /** The JSON of {@link #toJson(Object, int)} for a map of collections of strings, written as {@link #writeJson(Writer, Collection)} does. */
+    /**
+     * The JSON of {@link #toJson(Object, int)} for a map of collections of strings, written as {@link #writeJson(Writer, Collection)} does.
+     */
     static void writeJson(Writer out, Map<String, ? extends Collection<String>> byName) throws IOException {
         out.write('{');
         boolean first = true;
@@ -982,7 +1069,9 @@ final class GraphExport {
         out.write(']');
     }
 
-    /** The simple name of an object's class, as the export names nodes, flows and errors by it. */
+    /**
+     * The simple name of an object's class, as the export names nodes, flows and errors by it.
+     */
     static String simpleClassName(Object object) {
         // Checkstyle: allow Class.getSimpleName
         return object.getClass().getSimpleName();
@@ -1027,7 +1116,8 @@ final class GraphExport {
                 case '\n' -> sb.append("\\n");
                 // A control character, or half of a surrogate pair, which a string constant may
                 // hold alone and UTF-8 can't encode: escaped, as JSON allows.
-                default -> sb.append(c < 0x20 || Character.isSurrogate(c) ? String.format("\\u%04x", (int) c) : String.valueOf(c));
+                default ->
+                        sb.append(c < 0x20 || Character.isSurrogate(c) ? String.format("\\u%04x", (int) c) : String.valueOf(c));
             }
         }
         sb.append('"');
