@@ -182,9 +182,12 @@ final class ThreadEscape {
     static final String VM = "com.oracle.svm.";
 
     /**
-     * Controls, which must break the publication examples: the kinds of site to leave out
-     * ({@code -Dsideeffects.controlLeaveOut=static,field,array,copy,handle,opaque}), {@code imageheap}, which leaves the summaries of the types the image heap
-     * holds out of the roots, and {@code summaries}, which stops a shared summary from sharing every object of its type: to see how much of the answer each decides.
+     * Parts of the analysis to switch off, as controls: each must break the publication examples,
+     * which shows how much of the answer it decides. Given as
+     * {@code -Dsideeffects.controlLeaveOut=static,field,array,copy,handle,opaque,imageheap,summaries}:
+     * a kind of site; {@code imageheap}, which leaves the summaries of the image heap's types out of
+     * the roots; {@code summaries}, which stops a shared summary from sharing every object of its
+     * type.
      */
     static final Set<String> LEAVE_OUT = Set.of(System.getProperty("sideeffects.controlLeaveOut", "").split(","));
 
@@ -239,9 +242,11 @@ final class ThreadEscape {
     /** The objects shared, or with shared contents, whose consequences are not worked out yet. */
     private final Deque<AnalysisObject> work = new ArrayDeque<>();
 
-    /** The objects whose shared contents, sharing, or referent were worked out. */
+    /** The objects whose shared contents were worked out. */
     private final Set<AnalysisObject> contentDone = new HashSet<>();
+    /** The shared objects whose sharing was worked out. */
     private final Set<AnalysisObject> fullDone = new HashSet<>();
+    /** The objects whose referent, as references, was worked out. */
     private final Set<AnalysisObject> referentDone = new HashSet<>();
 
     /** The declared types of the saturated flows that share all their objects. */
@@ -311,10 +316,12 @@ final class ThreadEscape {
         spread();
         PointsToExport.step("thread escape: reachable objects", start);
         if (PROGRESS) {
-            PointsToExport.diagnostics().println("THREADPROGRESS done: places shared " + places.shareVisits + ", closures " + places.closures.size() + ", visits " + places.visits + ", children " + places.childrenSeen + ", shared " + shared.size());
+            PointsToExport.diagnostics().println("THREADPROGRESS done: places shared " + places.shareVisits + ", closures " + places.closures.size() + ", visits " + places.visits + ", children " +
+                            places.childrenSeen + ", shared " + shared.size());
         }
         if (explain != null) {
-            PointsToExport.diagnostics().println("THREADESCAPE " + sites.storeSites + " store sites, " + sites.copySites + " copy and clone sites, " + sites.linkedCalls + " calls that link their arguments");
+            PointsToExport.diagnostics().println("THREADESCAPE " + sites.storeSites + " store sites, " + sites.copySites + " copy and clone sites, " + sites.linkedCalls +
+                            " calls that link their arguments");
         }
     }
 
@@ -341,19 +348,22 @@ final class ThreadEscape {
         }
         for (OpaqueCall call : sites.opaqueCalls) {
             if (!inVirtualMachine(call.method()) && !LEAVE_OUT.contains("opaque")) {
-                afterCollection.add(() -> {
-                    for (List<TypeFlow<?>> argument : call.arguments()) {
-                        why.because(() -> "an argument of a call to code the analysis can't see, in " + call.where(), null);
-                        if (argument == null) {
-                            if (explain != null) {
-                                PointsToExport.diagnostics().println("THREADESCAPE an argument of a call to code the analysis can't see, in " + call.where() + ", has no flow");
-                            }
-                            addAnyOf(objectType);
-                        } else {
-                            share(sites.heldOf(call.method(), argument));
-                        }
-                    }
-                });
+                afterCollection.add(() -> shareArguments(call));
+            }
+        }
+    }
+
+    /** Shares every argument of a call to code the analysis can't see; one without a flow may be any object. */
+    private void shareArguments(OpaqueCall call) {
+        for (List<TypeFlow<?>> argument : call.arguments()) {
+            why.because(() -> "an argument of a call to code the analysis can't see, in " + call.where(), null);
+            if (argument == null) {
+                if (explain != null) {
+                    PointsToExport.diagnostics().println("THREADESCAPE an argument of a call to code the analysis can't see, in " + call.where() + ", has no flow");
+                }
+                addAnyOf(objectType);
+            } else {
+                share(sites.heldOf(call.method(), argument));
             }
         }
     }
@@ -367,7 +377,8 @@ final class ThreadEscape {
         for (PendingSite pending : sites.pendingSites) {
             sites.register(pending.site(), pending.target());
             if (PROGRESS && ++registered % 2000 == 0) {
-                PointsToExport.diagnostics().println("THREADPROGRESS registered " + registered + " of " + sites.pendingSites.size() + " sites; closures " + places.closures.size() + ", places " + places.placeTable.size() +
+                PointsToExport.diagnostics().println("THREADPROGRESS registered " + registered + " of " + sites.pendingSites.size() + " sites; closures " + places.closures.size() + ", places " +
+                                places.placeTable.size() +
                                 ", meets " + reader.meets.size() + ", visits " + places.visits + ", children " + places.childrenSeen + ", " + (System.nanoTime() - start) / 1_000_000 + " ms");
             }
         }
@@ -376,10 +387,32 @@ final class ThreadEscape {
         afterCollection.clear();
     }
 
-    /** Shares what every thread reaches: static fields, the image heap, threads and references. */
+    /**
+     * Shares what every thread reaches: static fields, the image heap, threads and references. Then
+     * sorts the known objects not shared yet by type, for {@link #shareAll}.
+     */
     private void shareRoots() {
         AnalysisType thread = bb.getMetaAccess().lookupJavaType(Thread.class);
         AnalysisType reference = bb.getMetaAccess().lookupJavaType(Reference.class);
+        shareStaticFields();
+        shareImageHeap();
+        shareThreadsAndReferences(thread, reference);
+        for (AnalysisObject object : known) {
+            if (!shared.contains(object)) {
+                unshared.computeIfAbsent(object.type(), type -> new ArrayList<>()).add(object);
+            }
+            if (!contents.contains(object)) {
+                uncontained.computeIfAbsent(object.type(), type -> new ArrayList<>()).add(object);
+            }
+        }
+    }
+
+    /**
+     * What the static fields may hold, as their flows say: every static field when asked to read
+     * the flows, otherwise only those accessed through unsafe, which any unsafe store may write.
+     * Every other store into a static field shares what it stores itself.
+     */
+    private void shareStaticFields() {
         if (readFlows) {
             for (AnalysisField field : universe.getFields()) {
                 if (field.isStatic() && field instanceof PointsToAnalysisField pointsTo && !isPrivate(field)) {
@@ -396,8 +429,13 @@ final class ThreadEscape {
                 }
             }
         }
-        // The image heap is what every thread reaches, and the snapshot lists its types. The summary of
-        // such a type stands for those objects, not for what the program allocates of the type.
+    }
+
+    /**
+     * The image heap is what every thread reaches, and the snapshot lists its types. The summary of
+     * such a type stands for those objects, not for what the program allocates of the type.
+     */
+    private void shareImageHeap() {
         if (universe.getHeapScanner() != null && !LEAVE_OUT.contains("imageheap")) {
             for (Map.Entry<AnalysisType, Set<ImageHeapConstant>> entry : universe.getHeapScanner().getImageHeap().getReachableObjects().entrySet()) {
                 if (!entry.getValue().isEmpty() && !entry.getKey().isPrimitive()) {
@@ -409,6 +447,10 @@ final class ThreadEscape {
                 }
             }
         }
+    }
+
+    /** The image heap's constants, the threads, and the references, which the reference handler thread processes. */
+    private void shareThreadsAndReferences(AnalysisType thread, AnalysisType reference) {
         for (AnalysisObject object : known) {
             if (object instanceof ConstantContextSensitiveObject || thread.isAssignableFrom(object.type())) {
                 why.because(() -> object instanceof ConstantContextSensitiveObject ? "an image heap constant" : "a thread", null);
@@ -420,14 +462,6 @@ final class ThreadEscape {
                 } else {
                     share(object);
                 }
-            }
-        }
-        for (AnalysisObject object : known) {
-            if (!shared.contains(object)) {
-                unshared.computeIfAbsent(object.type(), type -> new ArrayList<>()).add(object);
-            }
-            if (!contents.contains(object)) {
-                uncontained.computeIfAbsent(object.type(), type -> new ArrayList<>()).add(object);
             }
         }
     }
@@ -490,20 +524,12 @@ final class ThreadEscape {
         }
         List<Site> into = sites.sitesByObject.get(object);
         if (into != null) {
-            for (Site site : into) {
-                if (site.field == null || !isReferent(site.field)) {
-                    sites.fire(site, object);
-                }
-            }
+            fire(into, object, false);
         }
         if (contentTypes.add(type)) {
             for (Map.Entry<AnalysisType, List<Site>> entry : sites.sitesByType.entrySet()) {
                 if (entry.getKey().isAssignableFrom(type)) {
-                    for (Site site : entry.getValue()) {
-                        if (site.field == null || !isReferent(site.field)) {
-                            sites.fire(site, object);
-                        }
-                    }
+                    fire(entry.getValue(), object, false);
                 }
             }
         }
@@ -530,11 +556,7 @@ final class ThreadEscape {
     private void referentOf(AnalysisObject object) {
         List<Site> into = sites.sitesByObject.get(object);
         if (into != null) {
-            for (Site site : into) {
-                if (site.field != null && isReferent(site.field)) {
-                    sites.fire(site, object);
-                }
-            }
+            fire(into, object, true);
         }
         if (readFlows) {
             for (FieldTypeStore store : object.getExistingInstanceFieldTypeStores()) {
@@ -542,6 +564,16 @@ final class ThreadEscape {
                     why.because(() -> "field " + store.field().format("%H.%n"), object);
                     reach(store.writeFlow(), store.field().getType());
                 }
+            }
+        }
+    }
+
+    /** Fires the sites that go into the object: the stores into a referent, or every other site. */
+    private void fire(List<Site> into, AnalysisObject object, boolean referents) {
+        for (Site site : into) {
+            boolean intoReferent = site.field != null && isReferent(site.field);
+            if (intoReferent == referents) {
+                sites.fire(site, object);
             }
         }
     }
@@ -585,6 +617,7 @@ final class ThreadEscape {
                         position.getMethod().getDeclaringClass().toJavaName(true).startsWith(VM);
     }
 
+    /** Whether a method is the virtual machine's own code, under the {@code vm-code} assumption. */
     boolean inVirtualMachine(AnalysisMethod method) {
         return assumptions.contains("vm-code") && method.getDeclaringClass().toJavaName(true).startsWith(VM);
     }
@@ -599,10 +632,12 @@ final class ThreadEscape {
                         assumptions.contains("vm-fields") && owner.startsWith(VM);
     }
 
+    /** Whether the field is {@code Reference.referent}. */
     private static boolean isReferent(AnalysisField field) {
         return field.getName().equals("referent") && field.getDeclaringClass().toJavaName(true).equals("java.lang.ref.Reference");
     }
 
+    /** Shares what a held may hold: its objects, any object of its types, and what its places hold. */
     void share(Held held) {
         for (AnalysisObject object : held.objectsIn(bb)) {
             share(object);
@@ -615,6 +650,7 @@ final class ThreadEscape {
         }
     }
 
+    /** Shares the contents of what a held may hold. */
     void shareContents(Held held) {
         for (AnalysisObject object : held.objectsIn(bb)) {
             shareContents(object);
@@ -642,6 +678,7 @@ final class ThreadEscape {
         }
     }
 
+    /** Whether the analysis reached the method and made its flows. */
     static boolean analysed(AnalysisMethod method) {
         return method.isReachable() && method instanceof PointsToAnalysisMethod ptm && ptm.getTypeFlow().flowsGraphCreated();
     }
@@ -668,12 +705,14 @@ final class ThreadEscape {
         }
     }
 
+    /** Any object of the type is shared, once {@link #spread} gets to it. */
     void addAnyOf(AnalysisType type) {
         if (anyOf.add(type) && explain != null) {
             why.recordAnyOf(type);
         }
     }
 
+    /** Shares an object, with its contents; a reference shared only for the handler now has its referent shared too. */
     void share(AnalysisObject object) {
         if (shared.add(object)) {
             contents.add(object);
@@ -702,6 +741,7 @@ final class ThreadEscape {
         }
     }
 
+    /** Shares an object's contents, not the object. */
     void shareContents(AnalysisObject object) {
         if (contents.add(object)) {
             if (explain != null) {

@@ -71,6 +71,13 @@ final class StoredPlaces {
         boolean tooMany;
     }
 
+    /**
+     * More objects than this in what a place holds, and it is taken as any object of the types
+     * asked for: it has stopped telling objects apart.
+     */
+    private static final int MOST_OBJECTS = Integer.getInteger("sideeffects.mostObjects", 20_000);
+
+    // Taken from the thread escape these places are for.
     private final ThreadEscape escape;
     private final PointsToAnalysis bb;
     private final AnalysisType objectType;
@@ -79,9 +86,16 @@ final class StoredPlaces {
     FlowReader reader;
     SharingExplanation why;
 
+    /** What the sites store: into each field, into any array, and by unsafe stores, which may be into a field accessed through unsafe. */
     final Map<AnalysisField, List<Held>> storedInField = new HashMap<>();
     final List<Held> storedInArrays = new ArrayList<>();
     final List<Held> storedUnsafely = new ArrayList<>();
+
+    /** What is stored into each place, made the first time it is asked for. */
+    final Map<Object, PlaceData> placeTable = new HashMap<>();
+
+    /** The closure of each place, found the first time it is needed, once every store is known. */
+    final Map<Object, Closure> closures = new HashMap<>();
 
     /**
      * For each place, the types of what was shared of it, so that what a weaker restriction shared
@@ -92,20 +106,12 @@ final class StoredPlaces {
 
     /** For the explanation: the place being read, and which place it was reached from. */
     Source currentSource;
-
     final Map<Source, Source> sourceParent = new HashMap<>();
-    final Map<Object, PlaceData> placeTable = new HashMap<>();
 
-    /**
-     * More objects than this in what a place holds, and it is taken as any object of the types
-     * asked for: it has stopped telling objects apart.
-     */
-    private static final int MOST_OBJECTS = Integer.getInteger("sideeffects.mostObjects", 20_000);
-
+    // How much work the closures and the sharing took, for the progress lines.
     long visits;
     long childrenSeen;
     long shareVisits;
-    final Map<Object, Closure> closures = new HashMap<>();
 
     StoredPlaces(ThreadEscape escape) {
         this.escape = escape;
@@ -115,6 +121,7 @@ final class StoredPlaces {
         this.shared = escape.shared;
     }
 
+    /** Gives the places the parts of the thread escape made after them. */
     void connect(FlowReader reader, SharingExplanation why) {
         this.reader = reader;
         this.why = why;
@@ -291,13 +298,13 @@ final class StoredPlaces {
         if (done != null) {
             return done;
         }
-        Map<Object, Integer> index = new HashMap<>();
-        Map<Object, Integer> low = new HashMap<>();
-        Map<Object, List<Source>> kids = new HashMap<>();
-        Deque<Object> stack = new ArrayDeque<>();
+        Map<Object, Integer> index = new HashMap<>(); // the order in which each place was first visited
+        Map<Object, Integer> low = new HashMap<>(); // the lowest index the place reaches inside its group
+        Map<Object, List<Source>> kids = new HashMap<>(); // the places each place loads from
+        Deque<Object> stack = new ArrayDeque<>(); // visited places whose group isn't complete
         Set<Object> onStack = new HashSet<>();
-        Deque<Object> frames = new ArrayDeque<>();
-        Map<Object, Iterator<Source>> next = new HashMap<>();
+        Deque<Object> frames = new ArrayDeque<>(); // the current path
+        Map<Object, Iterator<Source>> next = new HashMap<>(); // how far each visit has come through the place's kids
         int[] counter = {0};
         Consumer<Object> visit = node -> {
             visits++;
@@ -332,7 +339,7 @@ final class StoredPlaces {
                     Object parent = frames.peek();
                     low.put(parent, Math.min(low.get(parent), low.get(node)));
                 }
-                if (low.get(node).equals(index.get(node))) {
+                if (low.get(node).equals(index.get(node))) { // node is its group's first place: the group is complete
                     List<Object> members = new ArrayList<>();
                     Object member;
                     do {
@@ -340,40 +347,7 @@ final class StoredPlaces {
                         onStack.remove(member);
                         members.add(member);
                     } while (member != node);
-                    Closure closure = new Closure();
-                    Set<Object> inside = new HashSet<>(members);
-                    for (Object m : members) {
-                        PlaceData data = placeData(m);
-                        if (!closure.tooMany) {
-                            int[] count = {0};
-                            ofTypes(data, FlowReader.NO_TYPES, found -> count[0] += found.size());
-                            if (closure.objects.size() + count[0] > MOST_OBJECTS) {
-                                closure.tooMany = true;
-                            } else {
-                                ofTypes(data, FlowReader.NO_TYPES, found -> closure.objects.addAll(found));
-                            }
-                        }
-                        closure.any.addAll(data.any);
-                        for (Source edge : kids.get(m)) {
-                            Object child = edge.key();
-                            if (inside.contains(child)) {
-                                continue;
-                            }
-                            Closure finished = closures.get(child);
-                            if (closure.tooMany) {
-                                break;
-                            }
-                            restrict(finished, edge.filters(), closure.objects, closure.any);
-                            if (closure.objects.size() > MOST_OBJECTS) {
-                                closure.tooMany = true;
-                            }
-                        }
-                    }
-                    if (closure.tooMany) {
-                        closure.objects.clear();
-                        closure.any.clear();
-                        closure.any.add(objectType);
-                    }
+                    Closure closure = closureOfGroup(members, kids);
                     for (Object m : members) {
                         closures.put(m, closure);
                     }
@@ -381,5 +355,48 @@ final class StoredPlaces {
             }
         }
         return closures.get(start);
+    }
+
+    /**
+     * The one closure of places on a cycle: what each of them holds, and what the places outside
+     * the group they load from hold, of the types they load. Those places' closures are found
+     * already.
+     */
+    private Closure closureOfGroup(List<Object> members, Map<Object, List<Source>> kids) {
+        Closure closure = new Closure();
+        Set<Object> inside = new HashSet<>(members);
+        for (Object m : members) {
+            PlaceData data = placeData(m);
+            if (!closure.tooMany) {
+                int[] count = {0};
+                ofTypes(data, FlowReader.NO_TYPES, found -> count[0] += found.size());
+                if (closure.objects.size() + count[0] > MOST_OBJECTS) {
+                    closure.tooMany = true;
+                } else {
+                    ofTypes(data, FlowReader.NO_TYPES, found -> closure.objects.addAll(found));
+                }
+            }
+            closure.any.addAll(data.any);
+            for (Source edge : kids.get(m)) {
+                Object child = edge.key();
+                if (inside.contains(child)) {
+                    continue;
+                }
+                Closure finished = closures.get(child);
+                if (closure.tooMany) {
+                    break;
+                }
+                restrict(finished, edge.filters(), closure.objects, closure.any);
+                if (closure.objects.size() > MOST_OBJECTS) {
+                    closure.tooMany = true;
+                }
+            }
+        }
+        if (closure.tooMany) {
+            closure.objects.clear();
+            closure.any.clear();
+            closure.any.add(objectType);
+        }
+        return closure;
     }
 }

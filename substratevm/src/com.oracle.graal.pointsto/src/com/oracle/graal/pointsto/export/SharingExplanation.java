@@ -90,10 +90,12 @@ final class SharingExplanation {
         this.contents = escape.contents;
     }
 
+    /** Gives the explanation the places, made before it. */
     void connect(StoredPlaces places) {
         this.places = places;
     }
 
+    /** Sets the reason, and the shared object it comes from, for what is shared next. */
     void because(Supplier<String> reason, AnalysisObject source) {
         because(reason, source, List.of());
     }
@@ -106,11 +108,13 @@ final class SharingExplanation {
         }
     }
 
+    /** How many states a held has, the types it may be any object of, and the places it reads from. */
     String summary(Held held) {
         return "(" + held.states().size() + " states, any " + held.any().stream().map(AnalysisType::toJavaName).toList() + ", from " +
                         held.stored().stream().map(this::describeStored).toList() + ")";
     }
 
+    /** The first four objects a held names, how many more, and the types it may be any object of. */
     String describe(Held held) {
         StringBuilder text = new StringBuilder();
         int shown = 0;
@@ -131,10 +135,12 @@ final class SharingExplanation {
         return path;
     }
 
+    /** A place a load reads from, with the types it reads as. */
     String describeStored(Source stored) {
         return describeStored(stored.key()) + (stored.filters().isEmpty() ? "" : " as " + stored.filters().stream().map(AnalysisType::toJavaName).toList());
     }
 
+    /** A place by its key: all the arrays, a field, or a flow. */
     String describeStored(Object stored) {
         if (stored == FlowReader.ARRAYS) {
             return "any array";
@@ -239,7 +245,8 @@ final class SharingExplanation {
                 owner = owner.replaceAll("\\$Proxy/s[0-9a-f]+", "\\$Proxy").replaceAll("\\.proxy[0-9]+\\.", ".proxyN.");
                 Object reason = method.getRootReason();
                 String why = String.valueOf(reason).replaceAll("\\$Proxy/s[0-9a-f]+", "\\$Proxy").replaceAll("[0-9a-f]{6,}", "#");
-                rootMethods.merge((method.isDirectRootMethod() ? "direct " : "virtual ") + owner + "." + method.getName() + " <- " + (why.length() > 150 ? why.substring(0, 150) : why), 1, Integer::sum);
+                rootMethods.merge((method.isDirectRootMethod() ? "direct " : "virtual ") + owner + "." + method.getName() + " <- " + (why.length() > 150 ? why.substring(0, 150) : why), 1,
+                                Integer::sum);
             }
         }
         PointsToExport.diagnostics().println("THREADESCAPE " + rootMethods.values().stream().mapToInt(Integer::intValue).sum() + " root methods:");
@@ -248,8 +255,16 @@ final class SharingExplanation {
 
     /** Prints, for the types the pattern names, a few chains of reasons and how the shared objects divide by the reason at the root of their chain. */
     void explainSharing() {
+        printRootReasons();
+        printRootMethods();
+        PointsToExport.diagnostics().println("THREADESCAPE " + arrayStoresOfAny.size() + " stores into arrays of a value that saturated:");
+        arrayStoresOfAny.stream().sorted().limit(60).forEach(line -> PointsToExport.diagnostics().println("THREADESCAPE   " + line));
+        printChains();
+    }
+
+    /** Prints how the shared objects divide by the reason at the root of their chain of causes. */
+    private void printRootReasons() {
         Map<String, Integer> roots = new TreeMap<>();
-        Map<String, Integer> printed = new HashMap<>();
         for (AnalysisObject object : shared) {
             Cause cause = causes.get(object);
             while (cause != null && cause.from() != null) {
@@ -258,14 +273,17 @@ final class SharingExplanation {
             String root = cause == null ? "?" : cause.how().replaceAll("^(any [^ ]+) .*", "$1").replaceAll("^(argument of a call in |result of a call in )[^ ]* (to [^ ]*).*", "$1$2");
             roots.merge(root.length() > 90 ? root.substring(0, 90) : root, 1, Integer::sum);
         }
-        PointsToExport.diagnostics().println("THREADESCAPE shared " + shared.size() + " and with shared contents " + contents.size() + " of " + known.size() + " known objects; by the reason at the root of the chain:");
+        PointsToExport.diagnostics().println("THREADESCAPE shared " + shared.size() + " and with shared contents " + contents.size() + " of " + known.size() +
+                        " known objects; by the reason at the root of the chain:");
         roots.entrySet().stream().sorted((a, b) -> b.getValue() - a.getValue()).limit(25).forEach(e -> PointsToExport.diagnostics().println("THREADESCAPE   " + e.getValue() + "  " + e.getKey()));
-        printRootMethods();
-        PointsToExport.diagnostics().println("THREADESCAPE " + arrayStoresOfAny.size() + " stores into arrays of a value that saturated:");
-        arrayStoresOfAny.stream().sorted().limit(60).forEach(line -> PointsToExport.diagnostics().println("THREADESCAPE   " + line));
+    }
+
+    /** Prints the chains of causes of the first 8 objects with shared contents that the pattern names, with the flows between. */
+    private void printChains() {
+        int chains = 0;
         for (AnalysisObject object : new TreeSet<>(contents)) {
             String name = GraphExport.PointsTo.objectName(object);
-            if (explain.matcher(name).find() && printed.merge("all", 1, Integer::sum) <= 8) {
+            if (explain.matcher(name).find() && ++chains <= 8) {
                 StringBuilder chain = new StringBuilder(GraphExport.PointsTo.objectName(object) + (shared.contains(object) ? "" : " (contents only)"));
                 AnalysisObject at = object;
                 for (int depth = 0; depth < 30; depth++) {
