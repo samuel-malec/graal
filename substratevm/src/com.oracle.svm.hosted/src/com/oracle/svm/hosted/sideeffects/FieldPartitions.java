@@ -47,25 +47,20 @@ import jdk.graal.compiler.nodes.java.AccessFieldNode;
 import jdk.graal.compiler.nodes.util.GraphUtil;
 
 /**
- * The partition of the objects each access to a field may touch, as the tool says (accesses.txt),
- * when it tells objects apart: an access gets the location of the field in its partition.
+ * With object-field partitions: gives each field access the location of its partition, as the
+ * tool's accesses.txt says (which groups of objects each access may touch).
  */
 final class FieldPartitions {
-    /**
-     * Where an access is, a tab, and its field -> its partition.
-     */
+    /** Position, a tab, and the field, mapped to the access's partition. */
     private final Map<String, String> located = new HashMap<>();
-    /**
-     * Control: a method, as the export names it, in which different references are claimed never
-     * to meet.
-     */
+    /** Test only: a method (as the export names it) in which different references are claimed never to point to the same object. */
     private final String claimNoAliasing;
 
     FieldPartitions(String claimNoAliasing) {
         this.claimNoAliasing = claimNoAliasing;
     }
 
-    /** Reads each access's partition: where it is, a tab, its field, a tab, its partition. */
+    /** Reads accesses.txt: per line the position, field and partition, tab-separated. */
     void read(Path accesses) throws IOException {
         for (String line : Files.readAllLines(accesses)) {
             String[] parts = line.split("\t", -1);
@@ -73,16 +68,16 @@ final class FieldPartitions {
         }
     }
 
-    /** Whether no access has a partition, as when objects are not told apart. */
+    /** Whether no access has a partition (field partitioning only). */
     boolean isEmpty() {
         return located.isEmpty();
     }
 
     /**
-     * Gives each access to a field the location of its partition, when the facts give every
-     * access to the field one, and reports the partitions each such field got.
+     * Gives each access to a field its partitioned location, but only if every access to that field in
+     * the graph has a partition, and reports the partitions each field got.
      *
-     * @return the fields given partitions
+     * @return the fields that were partitioned
      */
     Set<String> partition(StructuredGraph graph, List<String> report) {
         boolean split = Names.exportName(graph.method()).equals(claimNoAliasing);
@@ -97,8 +92,8 @@ final class FieldPartitions {
                 String found = partitionOf(access, field.getKey());
                 partitions.add(found == null || !split ? found : found + "#" + reference(access));
             }
-            // An access without a partition keeps the whole field for all of them; so does a
-            // field whose partition is the whole field everywhere.
+            // If any access lacks a partition, the whole field stays unpartitioned; likewise if every
+            // partition is the whole field.
             if (partitions.contains(null) || partitions.stream().allMatch(field.getKey()::equals)) {
                 continue;
             }
@@ -112,10 +107,7 @@ final class FieldPartitions {
         return partitioned;
     }
 
-    /**
-     * The partition the tool gives an access, by the first of its sites it names; null for an
-     * access without a position, one that never changes, and a volatile one.
-     */
+    /** An access's partition, by the first of its positions in accesses.txt; null without a position, for immutable or volatile accesses. */
     private String partitionOf(AccessFieldNode access, String field) {
         String at = PointsToExport.position(access.getNodeSourcePosition());
         if (at == null || access.getLocationIdentity().isImmutable() || access.ordersMemoryAccesses()) {
@@ -124,9 +116,7 @@ final class FieldPartitions {
         return Names.sitesOf(at).stream().map(site -> located.get(site + "\t" + field)).filter(Objects::nonNull).findFirst().orElse(null);
     }
 
-    /**
-     * The reference an access goes through, for the split: a parameter, or any other value.
-     */
+    /** The reference an access goes through, for the no-aliasing test claim: a parameter or any other value. */
     @SuppressWarnings("deprecation") // a node's id, only to tell values of this graph apart
     private static String reference(AccessFieldNode access) {
         return GraphUtil.unproxify(access.object()) instanceof ParameterNode parameter ? "param" + parameter.index() : "v" + access.object().getId();

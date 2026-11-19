@@ -33,10 +33,7 @@ import jdk.graal.compiler.nodes.java.StoreFieldNode;
 import jdk.graal.compiler.nodes.util.GraphUtil;
 import jdk.graal.compiler.phases.common.OverwrittenStoreEliminationPhase;
 
-/**
- * Runs Graal's {@link OverwrittenStoreEliminationPhase} on one of the program's methods, after the
- * analysis is applied (so with its partitions), and reports each store it removes.
- */
+/** Runs {@link OverwrittenStoreEliminationPhase} on each of the program's methods after the calls are narrowed (so with partitions), and reports each store it removes. */
 final class EliminateOverwrittenStoresPhase extends TimedPhase {
     private final String program;
     private final CompiledCodeCounts counts;
