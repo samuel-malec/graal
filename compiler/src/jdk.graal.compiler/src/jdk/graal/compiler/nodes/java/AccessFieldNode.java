@@ -97,8 +97,8 @@ public abstract class AccessFieldNode extends FixedWithNextNode implements Lower
     }
 
     /**
-     * Gives this access a location of its own, such as the field in one partition of the objects
-     * that have it ({@link FieldLocationIdentity#getPartition()}).
+     * Replaces this access's location with another location of the same field, typically one
+     * restricted to a partition ({@link FieldLocationIdentity#getPartition()}).
      */
     public void setLocationIdentity(FieldLocationIdentity newLocation) {
         assert newLocation.getField().equals(field) : newLocation + " is no location of " + field;
@@ -133,8 +133,8 @@ public abstract class AccessFieldNode extends FixedWithNextNode implements Lower
     }
 
     /**
-     * Makes this an ordinary access, whatever the field's modifier says: a volatile field that only
-     * one thread reaches orders this thread with no other. Only before the graph is lowered.
+     * Turns this into a plain access even if the field is volatile. Only valid when no other thread
+     * can reach the object, and only before lowering.
      */
     public void makePlain() {
         this.memoryOrder = MemoryOrderMode.PLAIN;

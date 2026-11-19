@@ -78,7 +78,7 @@ public final class InvokeWithExceptionNode extends WithExceptionNode implements 
     protected boolean polymorphic;
     protected InlineControl inlineControl;
     private boolean isInOOMETry;
-    /** What this invoke kills, a canonical {@link Invoke#killSet}: all of memory unless narrowed. */
+    /** The memory this invoke may write ({@link Invoke#killSet}); all of memory by default. */
     protected LocationIdentity[] killedLocations = KILLS_ANY;
 
     public InvokeWithExceptionNode(CallTargetNode callTarget, AbstractBeginNode exceptionEdge, int bci) {

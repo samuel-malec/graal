@@ -1287,8 +1287,9 @@ public abstract class DefaultJavaLoweringProvider implements LoweringProvider, V
     }
 
     /**
-     * The location of a lowered field access: the overridden one, in the access's partition if it
-     * has one, since an override such as Native Image's makes a new location from the field.
+     * The location for a lowered field access. {@link #overrideFieldLocationIdentity} (Native
+     * Image overrides it) builds a fresh location from the field and so drops a partition; this
+     * puts the partition back.
      */
     private FieldLocationIdentity fieldAccessLocation(FieldLocationIdentity location) {
         FieldLocationIdentity overridden = overrideFieldLocationIdentity(location);
