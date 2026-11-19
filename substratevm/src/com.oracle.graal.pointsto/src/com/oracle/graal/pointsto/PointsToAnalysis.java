@@ -119,14 +119,15 @@ public abstract class PointsToAnalysis extends AbstractAnalysisEngine {
     private ConcurrentMap<UnsafeStoreTypeFlow, Boolean> unsafeStores;
 
     /**
-     * The parameter flows that the declared types of the parameters of root methods are injected
-     * into, as the callers of a root method are not known: any object of the type may be passed.
+     * Parameter flows of root methods. Their callers are unknown, so the analysis injects every
+     * object of the declared parameter type into them. Used by the thread-escape analysis.
      */
     private final Set<TypeFlow<?>> rootParameterFlows = ConcurrentHashMap.newKeySet();
 
     /**
-     * Given each graph a method's flows are built from, once it is optimized and before they are:
-     * on the thread that builds them, so possibly on several at once. Null for none.
+     * Optional callback that receives each method's graph right before the analysis builds the
+     * method's type flows from it. Called on the analysis' worker threads, so it must be thread
+     * safe. Lets a client read the graphs without decoding them again after the analysis.
      */
     private volatile BiConsumer<PointsToAnalysisMethod, StructuredGraph> graphListener;
 

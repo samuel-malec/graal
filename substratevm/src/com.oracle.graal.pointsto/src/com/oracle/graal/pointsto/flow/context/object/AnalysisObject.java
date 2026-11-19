@@ -191,8 +191,8 @@ public class AnalysisObject implements Comparable<AnalysisObject> {
     }
 
     /**
-     * The field type stores the analysis made for this object's fields, without making any new
-     * one: a field no access reached has none, and holds nothing.
+     * The field type stores that already exist for this object, without creating new ones. A field
+     * that no access reached has no store and holds nothing.
      */
     public List<FieldTypeStore> getExistingInstanceFieldTypeStores() {
         AtomicReferenceArray<FieldTypeStore> stores = instanceFieldsTypeStore;
