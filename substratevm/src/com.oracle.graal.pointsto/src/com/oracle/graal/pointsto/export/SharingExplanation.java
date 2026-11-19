@@ -51,12 +51,13 @@ import com.oracle.graal.pointsto.typestate.TypeState;
 import jdk.vm.ci.code.BytecodePosition;
 
 /**
- * Why an object is shared, kept when asked to ({@code -Dsideeffects.explainSharing=<regex of type names>}):
- * how it was reached and from which shared object. Diagnostics only: nothing here changes the answer.
+ * Records why objects are shared, on request ({@code -Dsideeffects.explainSharing=<regex of type
+ * names>}): how each was reached and from which shared object. Diagnostics only; it never changes
+ * the result.
  */
 final class SharingExplanation {
 
-    /** Why an object is shared: how it was reached, from which shared object, and through which flows. */
+    /** Why an object is shared: how it was reached, from which shared object, through which flows. */
     record Cause(String how, AnalysisObject from, List<TypeFlow<?>> via) {
     }
 
@@ -68,14 +69,14 @@ final class SharingExplanation {
     private final Set<AnalysisObject> contents;
     StoredPlaces places;
 
-    /** For the explanation: the stores into arrays of a value the analysis can't name. */
+    /** For explanations: the array stores of a value the analysis can't name. */
     final List<String> arrayStoresOfAny = new ArrayList<>();
 
     final Map<AnalysisObject, Cause> causes = new HashMap<>();
     final Map<AnalysisType, AnalysisObject> anyOfFrom = new HashMap<>();
     final Map<AnalysisType, String> anyOfHow = new HashMap<>();
 
-    /** The reason the objects shared next are shared for: set by whoever shares them. */
+    /** The reason for whatever is shared next; set by the code that shares it. */
     private Supplier<String> how = () -> "?";
 
     private AnalysisObject from;
@@ -90,7 +91,7 @@ final class SharingExplanation {
         this.contents = escape.contents;
     }
 
-    /** Gives the explanation the places, made before it. */
+    /** Connects the places, created before the explanation. */
     void connect(StoredPlaces places) {
         this.places = places;
     }
@@ -108,13 +109,13 @@ final class SharingExplanation {
         }
     }
 
-    /** How many states a held has, the types it may be any object of, and the places it reads from. */
+    /** Summarizes a value: number of states, "any object of" types, and the places it reads from. */
     String summary(Held held) {
         return "(" + held.states().size() + " states, any " + held.any().stream().map(AnalysisType::toJavaName).toList() + ", from " +
                         held.stored().stream().map(this::describeStored).toList() + ")";
     }
 
-    /** The first four objects a held names, how many more, and the types it may be any object of. */
+    /** The first four objects a value names, how many more, and its "any object of" types. */
     String describe(Held held) {
         StringBuilder text = new StringBuilder();
         int shown = 0;
@@ -126,7 +127,7 @@ final class SharingExplanation {
         return text + (shown > 4 ? "and " + (shown - 4) + " more" : "") + held.any().stream().map(type -> " any " + type.toJavaName()).toList();
     }
 
-    /** For the explanation: what is stored into what, from the store the sharing started at to the object. */
+    /** For explanations: the chain of stores from where sharing started to the object. */
     List<Source> storedPath() {
         List<Source> path = new ArrayList<>();
         for (Source at = places.currentSource; at != null && path.size() < 20; at = places.sourceParent.get(at)) {
@@ -135,12 +136,12 @@ final class SharingExplanation {
         return path;
     }
 
-    /** A place a load reads from, with the types it reads as. */
+    /** A place a load reads from, with the types it reads it as. */
     String describeStored(Source stored) {
         return describeStored(stored.key()) + (stored.filters().isEmpty() ? "" : " as " + stored.filters().stream().map(AnalysisType::toJavaName).toList());
     }
 
-    /** A place by its key: all the arrays, a field, or a flow. */
+    /** A place by its key: all arrays, a field, or a flow. */
     String describeStored(Object stored) {
         if (stored == FlowReader.ARRAYS) {
             return "any array";
@@ -152,10 +153,7 @@ final class SharingExplanation {
         return String.valueOf(stored);
     }
 
-    /**
-     * How the analysis has an object reach a flow, from where it is made: the flows between, walking
-     * back along the inputs the analysis recorded ({@code -H:+TrackInputFlows}).
-     */
+    /** How an object reaches a flow from its allocation: the flows in between, walking back along the recorded inputs ({@code -H:+TrackInputFlows}). */
     private List<String> flowPath(List<TypeFlow<?>> starts, AnalysisObject object) {
         Map<TypeFlow<?>, TypeFlow<?>> next = new IdentityHashMap<>();
         Deque<TypeFlow<?>> queue = new ArrayDeque<>();
@@ -182,7 +180,7 @@ final class SharingExplanation {
         if (end == null) {
             return path;
         }
-        // The walk went back from the value to where the object is made; print it the way the object travels.
+        // The walk went backwards from the value; print it in the direction the object travels.
         for (TypeFlow<?> flow = end; path.size() < 40; flow = next.get(flow)) {
             String source = flow.getSource() instanceof BytecodePosition position ? " at " + GraphExport.PointsTo.site(position) : "";
             path.add(GraphExport.simpleClassName(flow) + source + (flow.isSaturated() ? " (saturated)" : ""));
@@ -193,7 +191,7 @@ final class SharingExplanation {
         return path;
     }
 
-    /** Whether the flow may hold the object: it does if it saturated, as far as one can tell. */
+    /** Whether the flow may hold the object (as far as can be told, a saturated flow does). */
     private boolean holds(TypeFlow<?> flow, AnalysisObject object) {
         if (flow.isSaturated()) {
             return flow.getDeclaredType() == null || flow.getDeclaredType().isAssignableFrom(object.type());
@@ -203,7 +201,7 @@ final class SharingExplanation {
             return false;
         }
         for (AnalysisObject held : state.objects(bb)) {
-            // The same object, or one of its type: a flow may name the object by its type alone.
+            // The same object, or one of its type: a flow may name an object by its type alone.
             if (held == object || held.type().equals(object.type())) {
                 return true;
             }
@@ -211,18 +209,18 @@ final class SharingExplanation {
         return false;
     }
 
-    /** An object is shared for the reason last given to {@link #because}. */
+    /** Records that an object is shared, for the reason last given to {@link #because}. */
     void recordCause(AnalysisObject object) {
         causes.put(object, new Cause(how.get(), from, via));
     }
 
-    /** Any object of a type is shared, or has shared contents, for the reason last given. */
+    /** Records that every object of a type is shared, or has shared contents, for the reason last given. */
     void recordAnyOf(AnalysisType type) {
         anyOfFrom.put(type, from);
         anyOfHow.put(type, how.get());
     }
 
-    /** An object is shared: the cause, and for the types the pattern names, the chain of stored places it went through. */
+    /** Records the cause of a shared object and, for matching types, the chain of places it went through. */
     void recordShared(AnalysisObject object) {
         recordCause(object);
         if (explain.matcher(GraphExport.PointsTo.objectName(object)).find() && object.isContextInsensitiveObject()) {
@@ -236,7 +234,7 @@ final class SharingExplanation {
         }
     }
 
-    /** Prints how the root methods were registered, the callers the analysis cannot see. */
+    /** Prints how the root methods were registered (their callers are invisible to the analysis). */
     private void printRootMethods() {
         Map<String, Integer> rootMethods = new TreeMap<>();
         for (AnalysisMethod method : universe.getMethods()) {
@@ -253,7 +251,7 @@ final class SharingExplanation {
         rootMethods.entrySet().stream().limit(5000).forEach(e -> PointsToExport.diagnostics().println("THREADESCAPE   root " + e.getValue() + "  " + e.getKey()));
     }
 
-    /** Prints, for the types the pattern names, a few chains of reasons and how the shared objects divide by the reason at the root of their chain. */
+    /** Prints, for matching types, a few chains of reasons and how the shared objects split by root reason. */
     void explainSharing() {
         printRootReasons();
         printRootMethods();
@@ -262,7 +260,7 @@ final class SharingExplanation {
         printChains();
     }
 
-    /** Prints how the shared objects divide by the reason at the root of their chain of causes. */
+    /** Prints how the shared objects split by the reason at the root of their chain. */
     private void printRootReasons() {
         Map<String, Integer> roots = new TreeMap<>();
         for (AnalysisObject object : shared) {
@@ -278,7 +276,7 @@ final class SharingExplanation {
         roots.entrySet().stream().sorted((a, b) -> b.getValue() - a.getValue()).limit(25).forEach(e -> PointsToExport.diagnostics().println("THREADESCAPE   " + e.getValue() + "  " + e.getKey()));
     }
 
-    /** Prints the chains of causes of the first 8 objects with shared contents that the pattern names, with the flows between. */
+    /** Prints the cause chains (with the flows in between) of the first 8 matching objects with shared contents. */
     private void printChains() {
         int chains = 0;
         for (AnalysisObject object : new TreeSet<>(contents)) {
