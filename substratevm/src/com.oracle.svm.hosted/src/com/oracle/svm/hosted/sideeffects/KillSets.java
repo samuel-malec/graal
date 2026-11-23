@@ -63,6 +63,11 @@ final class KillSets {
     private final List<LocationIdentity> vmState = new ArrayList<>();
     /** Number of lines in kills.txt, for timings.txt. */
     private long methodsWithFacts;
+    /**
+     * Upper bound, never sound: every call kills only {@link #killedByEveryCall()}, whatever its
+     * callees write.
+     */
+    private boolean writeNothing;
 
     /**
      * @param vm whether narrowed calls kill the VM state and the VM locations a callee writes (off
@@ -85,6 +90,15 @@ final class KillSets {
                 written.put(parts[0], parts[1].isEmpty() ? List.of() : List.of(parts[1].split(",")));
             }
         }
+    }
+
+    /**
+     * Upper bound for a measurement, never sound: no call writes a field or an array, only the VM's
+     * state that every narrowed call kills stays. Counts what the kill sets could free at most, and
+     * needs no facts and no list of kill sets. The image may be wrong and must not be run.
+     */
+    void writeNothing() {
+        writeNothing = true;
     }
 
     /** Test only: claims that a method writes nothing, so a wrong answer shows in the program's output. */
@@ -126,6 +140,9 @@ final class KillSets {
      * anything. A field in {@code partitioned} is killed both as a whole and in its partition.
      */
     LocationIdentity[] killsOf(MethodCallTargetNode target, Set<String> partitioned) {
+        if (writeNothing) {
+            return new LocationIdentity[0];
+        }
         HostedMethod method = (HostedMethod) target.targetMethod();
         HostedMethod[] callees = target.invokeKind().isDirect() ? new HostedMethod[]{method} : method.getImplementations();
         if (callees.length == 0) {

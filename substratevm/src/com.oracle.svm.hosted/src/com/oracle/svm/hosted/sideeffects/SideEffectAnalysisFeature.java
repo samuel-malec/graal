@@ -201,7 +201,9 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
 
         @Option(help = "Where the kill sets are computed. tool: the Python tool (effects.kills) on the JSON export. " +
                         "build: in the image builder (KillSetComputation), with no export unless lock elision or the graphs need one; without thread escape it reuses the graphs the analysis built, so no graph is decoded again. " +
-                        "both: both, and the build fails if they differ. build and both support only per-field partitions and no ignored effects.", //
+                        "both: both, and the build fails if they differ. build and both support only per-field partitions and no ignored effects. " +
+                        "none: an upper bound for a measurement, never sound: every call kills only the VM's state, no field and no array, " +
+                        "so no facts are exported and no kill sets worked out; the image may be wrong and must not be run, only its counts are read.", //
                         stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<String> SideEffectAnalysisKillSets = new HostedOptionKey<>("tool");
     }
@@ -250,6 +252,14 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
 
     @Override
     public void afterAnalysis(AfterAnalysisAccess access) {
+        if (narrow && killSetsBy.equals("none")) {
+            if (elideLocks || !partition.equals("field") || !ignoredEffects.isEmpty()) {
+                throw UserError.abort("-H:SideEffectAnalysisKillSets=none kills no field at any call: it needs no facts, so -H:+SideEffectAnalysisElideLocks, " +
+                                "-H:SideEffectAnalysisPartition and -H:SideEffectAnalysisIgnoreEffects have nothing to work on");
+            }
+            killSets.writeNothing();
+            return;
+        }
         if (!narrow && !elideLocks) {
             return;
         }
@@ -311,7 +321,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
                             "-H:-SideEffectAnalysisThreadEscape leaves out what -H:+SideEffectAnalysisElideLocks, -H:SideEffectAnalysisAssumptions and -H:SideEffectAnalysisClaimLocksLocal need");
         }
         if (!List.of("tool", "build", "both").contains(killSetsBy)) {
-            throw UserError.abort("-H:SideEffectAnalysisKillSets is tool, build or both, not %s", killSetsBy);
+            throw UserError.abort("-H:SideEffectAnalysisKillSets is tool, build, both or none (none only with narrowed calls, and then no export is made), not %s", killSetsBy);
         }
         if (inBuild && (!partition.equals("field") || !ignoredEffects.isEmpty())) {
             throw UserError.abort("-H:SideEffectAnalysisKillSets=%s partitions by field and leaves no effect out: -H:SideEffectAnalysisPartition and -H:SideEffectAnalysisIgnoreEffects need the tool",
@@ -492,6 +502,9 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         }
         if (!ignoredEffects.isEmpty()) {
             timings.append(String.format("# the kill of %s is left out of the kill sets: an upper bound, not sound%n", ignoredEffects));
+        }
+        if (narrow && killSetsBy.equals("none")) {
+            timings.append(String.format("# every call kills only the VM's state: an upper bound for counting loads, not sound, the image must not be run%n"));
         }
         if (elideLocks) {
             lockElision.appendTo(timings);
