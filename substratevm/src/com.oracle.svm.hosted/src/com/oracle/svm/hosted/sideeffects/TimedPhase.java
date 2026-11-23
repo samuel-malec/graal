@@ -30,10 +30,7 @@ import jdk.graal.compiler.nodes.GraphState;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.phases.Phase;
 
-/**
- * A phase of the side-effect analysis: it applies to every graph, and the time it takes is added
- * to its step in timings.txt.
- */
+/** A phase of the side-effect analysis that runs on every graph and adds its time to its step in timings.txt. */
 abstract class TimedPhase extends Phase {
     private final StepTimes times;
     private final String step;

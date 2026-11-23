@@ -78,7 +78,7 @@ public final class InvokeNode extends AbstractMemoryCheckpoint implements Invoke
     protected int bci;
     protected boolean polymorphic;
     protected InlineControl inlineControl;
-    /** What this invoke kills, a canonical {@link Invoke#killSet}. */
+    /** The memory this invoke may write, normalized by {@link Invoke#killSet}. */
     protected LocationIdentity[] killedLocations;
     private boolean isInOOMETry;
     private boolean sideEffect;

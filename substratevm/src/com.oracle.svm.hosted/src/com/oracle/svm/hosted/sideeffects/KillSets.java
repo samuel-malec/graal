@@ -45,36 +45,30 @@ import jdk.graal.compiler.nodes.java.MethodCallTargetNode;
 import jdk.vm.ci.meta.JavaKind;
 
 /**
- * What each method, with everything it calls, may write, as the tool says (kills.txt), in Graal's
- * locations: what a call kills is what its callees may write.
+ * Turns kills.txt (what each method may write, including through its callees) into Graal locations.
+ * A call kills the union of what its possible callees may write.
  * <p>
- * Every narrowed call also kills what a safepoint in its callees may change, as Native Image's own
- * safepoints do: see {@link SideEffectAnalysisFeature}.
+ * Every narrowed call also kills the VM state that a safepoint in a callee may change, as Native
+ * Image's own safepoints do; see {@link SideEffectAnalysisFeature}.
  */
 final class KillSets {
     private final String program;
     private final boolean vm;
     private final boolean platform;
-    /**
-     * Method name and descriptor -> the partitions it may write; absent: anything.
-     */
+    /** Method name and descriptor to the partitions it may write; a missing method may write anything. */
     private final Map<String, List<String>> written = new HashMap<>();
-    /**
-     * The image's fields by name, to give Graal's locations for the partitions.
-     */
+    /** The image's fields by name, to build Graal locations for partitions. */
     private final Map<String, HostedField> fields = new HashMap<>();
-    /**
-     * The VM's state every narrowed call kills.
-     */
+    /** The VM state every narrowed call kills. */
     private final List<LocationIdentity> vmState = new ArrayList<>();
-    /** How many lines kills.txt has, for timings.txt. */
+    /** Number of lines in kills.txt, for timings.txt. */
     private long methodsWithFacts;
 
     /**
-     * @param vm whether every narrowed call kills the VM's state and the VM's locations a callee
-     *            writes (off is a control)
-     * @param platform whether a call kills the platform's fields its callees write (off is a
-     *            control)
+     * @param vm whether narrowed calls kill the VM state and the VM locations a callee writes (off
+     *            only for testing)
+     * @param platform whether calls kill the JDK and VM fields their callees write (off only for
+     *            testing)
      */
     KillSets(String program, boolean vm, boolean platform) {
         this.program = program;
@@ -82,7 +76,7 @@ final class KillSets {
         this.platform = platform;
     }
 
-    /** Reads what each method may write, a line of kills.txt each: method, a tab, and the partitions, or any. */
+    /** Reads kills.txt: per line the method, a tab, and its partitions or {@code any}. */
     void read(List<String> kills) {
         for (String line : kills) {
             methodsWithFacts++;
@@ -93,17 +87,17 @@ final class KillSets {
         }
     }
 
-    /** Control: claims that a method writes nothing, so that a wrong answer shows in the output. */
+    /** Test only: claims that a method writes nothing, so a wrong answer shows in the program's output. */
     void claimWritesNothing(String method) {
         written.put(method, List.of());
     }
 
-    /** How many methods the tool's answer has a line for, any included. */
+    /** Number of methods in kills.txt, {@code any} included. */
     long methodsWithFacts() {
         return methodsWithFacts;
     }
 
-    /** Takes the image's fields, which Graal's locations are made of, and the VM's state. */
+    /** Looks up the image's fields (Graal locations are built from them) and collects the VM state. */
     void useImage(HostedUniverse universe) {
         for (HostedField field : universe.getFields()) {
             fields.put(Names.fieldName(field), field);
@@ -117,19 +111,19 @@ final class KillSets {
         }
     }
 
-    /** What every narrowed call kills besides what its callees write: the VM's state, unless the control leaves it out. */
+    /** What every narrowed call kills in addition to its callees' writes: the VM state (unless disabled for testing). */
     List<LocationIdentity> killedByEveryCall() {
         return vm ? vmState : List.of();
     }
 
-    /** Whether a location is the VM's state that every narrowed call kills. */
+    /** Whether a location is part of the VM state every narrowed call kills. */
     boolean isVMState(LocationIdentity location) {
         return vmState.contains(location);
     }
 
     /**
-     * What a call may write: the kills of every method it may call, null for anything. A field
-     * that {@code partitioned} names is killed in its partition too.
+     * What a call may write: the union of the kill sets of all its possible targets, or null for
+     * anything. A field in {@code partitioned} is killed both as a whole and in its partition.
      */
     LocationIdentity[] killsOf(MethodCallTargetNode target, Set<String> partitioned) {
         HostedMethod method = (HostedMethod) target.targetMethod();
@@ -155,18 +149,19 @@ final class KillSets {
     }
 
     /**
-     * Graal's locations for a partition the tool names: a field, an array kind, or with objects
-     * told apart a field of a set of them, Aliasing$Counter.value@main:199. A field this graph
-     * gives partitions is killed in its partition, and as a whole too, for the phases that key
-     * field accesses by the field alone, such as read elimination; any other is killed whole.
+     * The Graal locations for a name in kills.txt: a field, an array kind, or (with object-field
+     * partitions) a field in one group of objects, e.g. {@code Aliasing$Counter.value@main:199}. A
+     * field that is partitioned in this graph is killed in its partition and also as a whole, because
+     * some phases (read elimination) key field accesses by the field alone. Other fields are killed
+     * whole.
      */
     private List<LocationIdentity> locations(String partition, Set<String> partitioned) {
         if (partition.equals("init")) {
-            return List.of(); // the callee's own initialization: see SideEffectAnalysisFeature
+            return List.of(); // the callee initializes what it allocates itself; see SideEffectAnalysisFeature
         }
         if (partition.startsWith("vm:")) {
             LocationIdentity location = PointsToExport.VM_LOCATIONS.get(partition);
-            return !vm ? List.of() : location != null ? List.of(location) : null; // null: unnamed here, so anything
+            return !vm ? List.of() : location != null ? List.of(location) : null; // null: not a VM location known to this build, so anything
         }
         String whole = partition.contains("@") ? partition.substring(0, partition.indexOf('@')) : partition;
         if (whole.endsWith("[]")) {
@@ -174,15 +169,13 @@ final class KillSets {
         }
         HostedField field = fields.get(whole);
         if (field == null || (!platform && !PointsToExport.isProgramClass(field.getDeclaringClass().toJavaName(true), program))) {
-            return List.of(); // the image never accesses it, so there is nothing to kill; or the control
+            return List.of(); // not accessed in the image, so nothing to kill (or the platform-field kill is disabled for testing)
         }
         return partitioned.contains(whole) ? List.of(new FieldLocationIdentity(field), new FieldLocationIdentity(field, false, partition))
                         : List.of(new FieldLocationIdentity(field));
     }
 
-    /**
-     * The element kinds of an export's array partition: byte[] stands for boolean[] too.
-     */
+    /** The element kinds of an array partition name; {@code byte[]} also stands for {@code boolean[]}. */
     private static List<JavaKind> arrayKinds(String partition) {
         return switch (partition) {
             case "byte[]" -> List.of(JavaKind.Byte, JavaKind.Boolean);
@@ -191,7 +184,7 @@ final class KillSets {
         };
     }
 
-    /** The class of a primitive type by its name, for an array partition. */
+    /** The class of a primitive type, by name. */
     private static Class<?> primitive(String name) {
         return switch (name) {
             case "char" -> char.class;

@@ -136,7 +136,8 @@ import jdk.vm.ci.meta.ResolvedJavaMethod;
 import jdk.vm.ci.meta.ResolvedJavaType;
 
 /**
- * Exports a method's Graal IR, scheduled, with what the points-to analysis says of its values.
+ * Exports a method's scheduled Graal IR as JSON, annotated with what the points-to analysis knows about its values.
+ * Used by the token-form translation ({@code graal2ct}); the facts borrow its naming and points-to helpers.
  */
 final class GraphExport {
 
@@ -149,8 +150,8 @@ final class GraphExport {
     }
 
     /**
-     * A method's entry in the export: its name and descriptor, its blocks in reverse post order, the
-     * values its ops name, and what it has that the export can't express.
+     * A method's JSON entry: name and descriptor, blocks in reverse post order, the values its ops refer to,
+     * and any constructs the export can't express (in {@code unsupported}).
      */
     @SuppressWarnings("try")
     static Map<String, Object> export(PointsToAnalysis bb, PointsToAnalysisMethod method, ObjectNames objectNames) {
@@ -408,7 +409,7 @@ final class GraphExport {
         }
 
         /**
-         * What a field or array access may touch: a static field's is its class's statics.
+         * The objects a field or array access may touch; for a static field, its class's statics holder.
          */
         List<String> receivers(Node access) {
             if (access instanceof AccessFieldNode field) {
@@ -418,9 +419,8 @@ final class GraphExport {
         }
 
         /**
-         * The flows whose states say what a value may be, in the flows graph of the method as it
-         * was before the analysis cloned it for contexts; null if the value comes from something
-         * no flow was made for.
+         * The flows that say what a value may be, in the method's flows graph before the analysis cloned
+         * it per context; null if no flow was made for the value.
          */
         List<TypeFlow<?>> flowsOf(ValueNode reference) {
             List<List<TypeFlow<?>>> behind = sourcesBehind(reference);
@@ -433,8 +433,8 @@ final class GraphExport {
         }
 
         /**
-         * The names of the objects a value may be, over every context the method was analysed in;
-         * null if the analysis can't name them: a flow saturated, or none was made for the value.
+         * The names of the objects a value may be, over every context the method was analyzed in;
+         * null if unknown (a flow saturated, or no flow exists).
          */
         List<String> objects(ValueNode reference) {
             List<List<TypeFlow<?>>> behind = sourcesBehind(reference);
@@ -457,9 +457,8 @@ final class GraphExport {
         }
 
         /**
-         * The flows of each value a reference may be, through phis and proxies, leaving out the
-         * null constant: one list for each value, in the order the walk meets them; null if a
-         * value comes from something no flow was made for.
+         * The flows of each value a reference may come from, looking through phis and proxies and skipping
+         * null constants; one list per value, in walk order. Null if some value has no flow.
          */
         private List<List<TypeFlow<?>>> sourcesBehind(ValueNode reference) {
             List<List<TypeFlow<?>>> behind = new ArrayList<>();
@@ -484,8 +483,8 @@ final class GraphExport {
         }
 
         /**
-         * The flows the analysis made for a value: a parameter's, or those at the value's position
-         * that make, load or return it.
+         * The flows the analysis made for a value: a parameter's, or those at the value's position that
+         * create, load or return it.
          */
         private List<TypeFlow<?>> sources(ValueNode value) {
             List<TypeFlow<?>> found = new ArrayList<>();
@@ -512,7 +511,7 @@ final class GraphExport {
         }
 
         /**
-         * The flow's state over every context, null if it saturated in any; a disabled flow, in code the analysis never reached, holds nothing.
+         * The flow's state over every context, or null if it saturated in any. A disabled flow (code the analysis never reached) holds nothing.
          */
         private TypeState fold(TypeFlow<?> original) {
             if (original.isSaturated()) {
@@ -624,8 +623,8 @@ final class GraphExport {
     }
 
     /**
-     * An op for a node that touches memory, null for one that provably does
-     * not. Anything else is recorded in {@code unsupported}.
+     * The JSON op for a node that touches memory, or null for one that provably doesn't.
+     * Anything else is listed in {@code unsupported}.
      */
     private static Map<String, Object> exportNode(FixedNode node, Map<String, List<InvokeTypeFlow>> flowsByBci,
                                                   Map<String, String> values, List<String> unsupported) {
@@ -694,7 +693,7 @@ final class GraphExport {
     }
 
     /**
-     * Whether a scheduled node goes into the export's nodes: not the control flow's begins and ends, frame and virtual object states, or call targets.
+     * Whether a scheduled node is exported: not block begins and ends, frame or virtual-object states, or call targets.
      */
     private static boolean isScheduledValueOrEffect(Node node) {
         if (node instanceof ExceptionObjectNode) {

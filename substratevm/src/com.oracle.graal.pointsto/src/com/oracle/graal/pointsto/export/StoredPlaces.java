@@ -47,15 +47,15 @@ import com.oracle.graal.pointsto.meta.AnalysisField;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 
 /**
- * What was stored into the places a saturated load reads from: a field, all the arrays (the analysis gives
- * them one elements flow), or a flow that is rebuilt from its inputs. Finds, once for each place, everything
- * that may be in it and in the places it loads from (a closure, found with Tarjan's algorithm so that places
- * on a cycle share one), restricts it to the types a load asks for when it is read, and shares what a place
- * holds.
+ * Tracks what was stored into the places a saturated load reads from: a field, all arrays (the
+ * analysis gives them one element flow), or a flow rebuilt from its inputs. For each place it
+ * computes, once, everything that may be in it and in the places it loads from (a transitive
+ * closure, using Tarjan's algorithm so places on a cycle share one result), restricts that to the
+ * types a load asks for, and shares it.
  */
 final class StoredPlaces {
 
-    /** What is stored into one place: the objects by exact type, the types of saturated stores, and the places it loads from. */
+    /** What is stored into one place: objects by exact type, types of saturated stores, and the places it loads from. */
     private static final class PlaceData {
         final Map<AnalysisType, List<AnalysisObject>> byType = new HashMap<>();
         final List<AnalysisType> arrayTypes = new ArrayList<>();
@@ -63,21 +63,18 @@ final class StoredPlaces {
         final Set<Source> nested = new LinkedHashSet<>();
     }
 
-    /** What a place holds, with the places it loads from, transitively, of all types: found once for a place, restricted for each load. */
+    /** Everything a place holds, including transitively through places it loads from; computed once per place, restricted per load. */
     private static final class Closure {
         final Set<AnalysisObject> objects = new LinkedHashSet<>();
         final Set<AnalysisType> any = new LinkedHashSet<>();
-        /** Too many objects to name: any object of any type. */
+        /** Too many objects to track: any object of any type. */
         boolean tooMany;
     }
 
-    /**
-     * More objects than this in what a place holds, and it is taken as any object of the types
-     * asked for: it has stopped telling objects apart.
-     */
+    /** Above this many objects, a place counts as holding any object of the requested types. */
     private static final int MOST_OBJECTS = Integer.getInteger("sideeffects.mostObjects", 20_000);
 
-    // Taken from the thread escape these places are for.
+    // Shared with the thread-escape run these places belong to.
     private final ThreadEscape escape;
     private final PointsToAnalysis bb;
     private final AnalysisType objectType;
@@ -86,29 +83,29 @@ final class StoredPlaces {
     FlowReader reader;
     SharingExplanation why;
 
-    /** What the sites store: into each field, into any array, and by unsafe stores, which may be into a field accessed through unsafe. */
+    /** What the sites store: per field, into any array, and by unsafe stores (which may target an unsafe-accessed field). */
     final Map<AnalysisField, List<Held>> storedInField = new HashMap<>();
     final List<Held> storedInArrays = new ArrayList<>();
     final List<Held> storedUnsafely = new ArrayList<>();
 
-    /** What is stored into each place, made the first time it is asked for. */
+    /** What is stored into each place; created on first request. */
     final Map<Object, PlaceData> placeTable = new HashMap<>();
 
-    /** The closure of each place, found the first time it is needed, once every store is known. */
+    /** Each place's closure, computed on first need, after all stores are known. */
     final Map<Object, Closure> closures = new HashMap<>();
 
     /**
-     * For each place, the types of what was shared of it, so that what a weaker restriction shared
-     * is not shared again: of the objects, and of their contents.
+     * Per place, the types already shared from it (as objects and as contents), so that a narrower
+     * request doesn't share the same objects again.
      */
     private final Map<Object, List<List<AnalysisType>>> taken = new HashMap<>();
     private final Map<Object, List<List<AnalysisType>>> contentsTaken = new HashMap<>();
 
-    /** For the explanation: the place being read, and which place it was reached from. */
+    /** For explanations: the place being read and the place it was reached from. */
     Source currentSource;
     final Map<Source, Source> sourceParent = new HashMap<>();
 
-    // How much work the closures and the sharing took, for the progress lines.
+    // Work counters for the progress output.
     long visits;
     long childrenSeen;
     long shareVisits;
@@ -121,13 +118,13 @@ final class StoredPlaces {
         this.shared = escape.shared;
     }
 
-    /** Gives the places the parts of the thread escape made after them. */
+    /** Connects the places to the other parts of thread escape, created after them. */
     void connect(FlowReader reader, SharingExplanation why) {
         this.reader = reader;
         this.why = why;
     }
 
-    /** Shares what was stored into a place, of the types asked for, and what is stored into the places it loads from. */
+    /** Shares what was stored into a place (of the requested types) and into the places it loads from. */
     void shareSource(Source start, boolean contentsOnly) {
         Deque<Source> queue = new ArrayDeque<>();
         queue.add(start);
@@ -164,7 +161,7 @@ final class StoredPlaces {
         }
     }
 
-    /** Takes a place to share what it holds of the types; false if that, or more, was taken already. */
+    /** Marks a place as shared for these types; false if these or wider types were already done. */
     boolean claim(Source source, boolean contentsOnly) {
         List<List<AnalysisType>> types = (contentsOnly ? contentsTaken : taken).computeIfAbsent(source.key(), k -> new ArrayList<>());
         for (List<AnalysisType> weaker : types) {
@@ -176,7 +173,7 @@ final class StoredPlaces {
         return true;
     }
 
-    /** Whether everything with all of the narrower types has all of the weaker ones. */
+    /** Whether every object with all the narrower types also has all the wider ones. */
     private boolean allAssignable(List<AnalysisType> weaker, List<AnalysisType> narrower) {
         for (AnalysisType type : weaker) {
             boolean implied = false;
@@ -193,7 +190,7 @@ final class StoredPlaces {
         return true;
     }
 
-    /** Calls the consumer with the objects of each exact type that has all the types: by the hierarchy, not by testing every type. */
+    /** Calls the consumer with the objects of each exact type that has all the given types, walking the type hierarchy. */
     private void ofTypes(PlaceData data, List<AnalysisType> filters, Consumer<List<AnalysisObject>> consumer) {
         if (filters.isEmpty()) {
             data.byType.values().forEach(consumer);
@@ -219,7 +216,7 @@ final class StoredPlaces {
         }
     }
 
-    /** What is stored into a place: the objects by exact type, the types of saturated stores, and the places it loads from. */
+    /** What is stored into a place: objects by exact type, types of saturated stores, and the places it loads from. */
     private PlaceData placeData(Object key) {
         PlaceData data = placeTable.get(key);
         if (data == null) {
@@ -243,7 +240,7 @@ final class StoredPlaces {
         return data;
     }
 
-    /** What is stored into the field, or into any array, as far as the sites say, or what feeds a flow that saturated. */
+    /** What the sites store into the field or into any array, or what feeds a saturated flow. */
     private List<Held> storedIn(Object where) {
         if (where == FlowReader.ARRAYS) {
             return storedInArrays;
@@ -259,7 +256,7 @@ final class StoredPlaces {
         return values;
     }
 
-    /** What a held may hold once every store is known: its own, and the stores into what it loads from, transitively. */
+    /** What a value may hold once all stores are known: its own objects plus, transitively, what was stored into what it loads from. */
     Held expand(Held held) {
         if (held.stored().isEmpty()) {
             return held;
@@ -273,7 +270,7 @@ final class StoredPlaces {
         return new Held(List.of(), new ArrayList<>(any), List.of(), new ArrayList<>(objects));
     }
 
-    /** Adds what a closure holds of the types, to the objects and the types of a held. */
+    /** Adds a closure's objects and types, restricted to the given types, to a value's contents. */
     private void restrict(Closure closure, List<AnalysisType> filters, Set<AnalysisObject> objects, Set<AnalysisType> any) {
         if (closure.tooMany) {
             reader.narrowAny(any, List.of(objectType), filters);
@@ -292,19 +289,19 @@ final class StoredPlaces {
         reader.narrowAny(any, closure.any, filters);
     }
 
-    /** The closure of a place, found with Tarjan's algorithm so that every place on a cycle gets the same one, and none is found twice. */
+    /** Computes a place's closure with Tarjan's algorithm: places on a cycle share one closure, and none is computed twice. */
     private Closure closureOf(Object start) {
         Closure done = closures.get(start);
         if (done != null) {
             return done;
         }
-        Map<Object, Integer> index = new HashMap<>(); // the order in which each place was first visited
-        Map<Object, Integer> low = new HashMap<>(); // the lowest index the place reaches inside its group
+        Map<Object, Integer> index = new HashMap<>(); // visit order
+        Map<Object, Integer> low = new HashMap<>(); // lowest index reachable within the component
         Map<Object, List<Source>> kids = new HashMap<>(); // the places each place loads from
-        Deque<Object> stack = new ArrayDeque<>(); // visited places whose group isn't complete
+        Deque<Object> stack = new ArrayDeque<>(); // visited places whose component isn't finished
         Set<Object> onStack = new HashSet<>();
-        Deque<Object> frames = new ArrayDeque<>(); // the current path
-        Map<Object, Iterator<Source>> next = new HashMap<>(); // how far each visit has come through the place's kids
+        Deque<Object> frames = new ArrayDeque<>(); // the current DFS path
+        Map<Object, Iterator<Source>> next = new HashMap<>(); // next child to visit, per place
         int[] counter = {0};
         Consumer<Object> visit = node -> {
             visits++;
@@ -339,7 +336,7 @@ final class StoredPlaces {
                     Object parent = frames.peek();
                     low.put(parent, Math.min(low.get(parent), low.get(node)));
                 }
-                if (low.get(node).equals(index.get(node))) { // node is its group's first place: the group is complete
+                if (low.get(node).equals(index.get(node))) { // node is the root of a finished component
                     List<Object> members = new ArrayList<>();
                     Object member;
                     do {
@@ -358,9 +355,8 @@ final class StoredPlaces {
     }
 
     /**
-     * The one closure of places on a cycle: what each of them holds, and what the places outside
-     * the group they load from hold, of the types they load. Those places' closures are found
-     * already.
+     * The closure shared by the places of one cycle: what each holds, plus what the places outside
+     * the cycle that they load from hold (already computed), restricted to the loaded types.
      */
     private Closure closureOfGroup(List<Object> members, Map<Object, List<Source>> kids) {
         Closure closure = new Closure();

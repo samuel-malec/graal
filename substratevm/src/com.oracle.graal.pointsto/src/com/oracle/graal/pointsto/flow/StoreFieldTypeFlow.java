@@ -158,7 +158,7 @@ public abstract class StoreFieldTypeFlow extends AccessFieldTypeFlow {
             return objectFlow;
         }
 
-        /** The flow of the stored value, null for the context insensitive store of a field. */
+        /** The flow of the stored value; null for the context-insensitive store of a field. */
         public TypeFlow<?> valueFlow() {
             return valueFlow;
         }

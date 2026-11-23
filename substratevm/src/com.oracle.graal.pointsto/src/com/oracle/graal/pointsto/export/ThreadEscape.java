@@ -66,151 +66,120 @@ import com.oracle.graal.pointsto.typestore.FieldTypeStore;
 import jdk.vm.ci.code.BytecodePosition;
 
 /**
- * Which objects of the points-to analysis another thread may reach. An object is shared when
- * something every thread reaches holds it, or when it is held by a shared object, or put into one.
- *
+ * Thread escape: computes which analysis objects another thread may reach ("shared" objects). A
+ * lock or volatile access on an object that is not shared cannot synchronize with another thread.
  * <p>
- * What every thread reaches: the contents of static fields; the image heap, whose objects are of
- * the types the snapshot lists; threads and the references the reference handler thread
- * processes; and what a call to a method the facts don't have at all, such as a native, may be
- * given or give back.
- *
- * <p>
- * What goes into an object is what the stores into it say. A store into a field, into an array,
- * or an unsafe store, shares what it stores once an object it may store into is shared, or has
- * its contents shared. A copy between arrays, and a clone, shares the contents of what it copies
- * from once the object it copies into has them. The sites are the flows the analysis made for
- * them. The analysis's own answer, what each field's flow says it may hold, merges the stores
- * of every call to a method into one, and is only read when asked to, or where it is the only
- * answer there is: a field accessed through unsafe, and an array when arrays have a flow of
- * their own.
- *
- * <p>
- * The analysis may name an object by its type alone, a summary that stands for any object of
- * exactly that type, or by where it was allocated. The summary is shared when an object it may
- * stand for is; and when the summary is shared on its own account, any object of the type is,
- * for it may be the one that was. The same goes for having contents shared.
- *
- * <p>
- * A call is described by what the facts say of its callees. A method the facts have, but with an
- * effect or a call they can't name, is an analysed method like any other except for that effect.
- * Most of those effects are the virtual machine's own: a class's initialization, a transition to
- * native code, an identity hash code. None of them stores a reference an object was given. The
- * ones that can, such as a raw write of a reference, we assume store references only into objects
- * reachable from the call's arguments: they may copy a reference from one object passed to the
- * call into another, but publish nothing else. In one call they can only meet the objects passed
- * in that call, one per argument, so the objects of different arguments are linked: once one of
- * them is shared, all the objects the other arguments may be are. A call with one argument that
- * is an object links nothing. Without facts for {@code Thread.currentThread}, the standalone
- * analysis never sees {@code new Thread(task)} store the task, for instance, which links the
- * thread, shared as every thread is, with the task.
- *
- * <p>
- * The analysis gives up on a flow that holds many types: it is saturated, and stops saying what
- * it holds. What it held is rebuilt from the flows that feed it (the analysis must have recorded
- * them, {@code -H:+TrackInputFlows}): where they are exact, what they hold; where one loads from
- * a field or from an array, what the stores into it say, restricted to the types the load gives;
- * where nothing is known, any object of the flow's type. Every store is collected before any of
- * this is used, so that the base of a store and the arguments of a call are what the stores say
- * they are, not any object of their declared type.
- *
- * <p>
- * A call through a function pointer, to code the analysis can't see, may keep every object it is
- * given: its arguments are shared. A reflective call is one.
- *
- * <p>
- * What the analysis can't show, we can assume, one named assumption at a time
- * ({@link PointsToExport#ASSUMPTIONS}); with none, the answer follows from the analysis alone:
+ * The computation is a mark phase, like a garbage collector's, starting from what every thread
+ * can see:
  * <ul>
- * <li>{@code thread-confined}: the fields a thread keeps to itself by design, the object it
- * parks on and its thread locals, are never read by another thread.
- * <li>{@code vm-fields}: the state of the virtual machine's own classes, their static fields
- * and the fields of their objects, is read only by the virtual machine.
- * <li>{@code vm-code}: the virtual machine's own code stores references only where the virtual
- * machine reads them. Where a program's object goes through the virtual machine, as a locked
- * object goes into the monitor table, the code that puts it there does not share it. This is
- * taken for the virtual machine's stores into arrays and by unsafe access, and into the fields of its
- * own classes; its stores into fields of the JDK's and the program's classes count, as they are
- * read by the code of those (a thread's holder is made by the virtual machine, and read by the JDK).
- * <li>{@code handler-references}: the reference handler thread processes the references the
- * collector found, and never reads their referents: a reference is shared for it without its
- * referent.
- * <li>{@code entry-points}: the callers of the analysis' roots, which are the virtual machine's
- * (C entry points, JNI, runtime linkage), pass only objects that are shared already, and keep
- * nothing a root returns or throws where another thread reaches it. The analysis does not know
- * the callers and injects every object of the declared type into a root's parameters; with this
- * assumption that injection does not count when a flow is rebuilt.
+ * <li><b>Roots.</b> Contents of static fields, the image heap, threads, the references the
+ * reference handler thread processes, and anything passed to or returned from a method the
+ * analysis has no facts for (such as a native method).</li>
+ * <li><b>Propagation.</b> An object stored into a shared object becomes shared. Stores are the
+ * analysis' store flows: field stores, array stores and unsafe stores. Array copies and clones
+ * share the source's contents once the destination's contents are shared.</li>
+ * <li><b>Summaries.</b> The analysis may name an object by its type alone (a summary for "any
+ * object of exactly this type") or by its allocation site. A summary is shared when any object it
+ * stands for is, and if a summary is shared in its own right, every object of the type is.</li>
  * </ul>
- *
  * <p>
- * The work is divided among classes of this package. {@link FlowReader} says what a flow may hold, also
- * when it saturated. {@link PublishingSites} turns the program's stores, copies, clones and calls into sites that
- * share what they move once the objects they move it into have shared contents. {@link StoredPlaces} says what was
- * stored into a field or into the arrays, and shares it. {@link SharingExplanation} keeps the reasons, when asked
- * to. This class holds what is shared, the roots, and the worklist that spreads sharing.
+ * <b>Calls with unknown effects.</b> Most unknown effects belong to the VM (class initialization,
+ * native transitions, identity hash codes) and store no references. Those that can, such as raw
+ * reference writes, are assumed to store only into objects reachable from the call's arguments,
+ * so the arguments of one call are linked: once one is shared, all are. Calls into code the
+ * analysis can't see at all (function pointers, reflection) share all their arguments.
+ * <p>
+ * <b>Saturated flows.</b> When a flow holds too many types the analysis stops tracking its
+ * contents. What it holds is then rebuilt from the flows that feed it (this needs
+ * {@code -H:+TrackInputFlows}): exact inputs as they are, loads by what was stored into the loaded
+ * field or array, and anything else as any object of the flow's declared type. All stores are
+ * collected before propagation starts, so store targets and call arguments are as precise as the
+ * stores allow.
+ * <p>
+ * <b>Assumptions.</b> Some facts the analysis can't show are assumed, each under a name
+ * ({@link PointsToExport#ASSUMPTIONS}); with none, the result follows from the analysis alone:
+ * <ul>
+ * <li>{@code thread-confined}: a thread's park blocker and thread locals are read only by that
+ * thread.</li>
+ * <li>{@code vm-fields}: the VM's own classes' static and instance fields are read only by the
+ * VM.</li>
+ * <li>{@code vm-code}: VM code stores references only where VM code reads them; for example,
+ * putting a locked object into the monitor table doesn't share it. This covers the VM's array and
+ * unsafe stores and its stores into its own classes' fields, but not into JDK or program classes'
+ * fields (a thread's holder is created by the VM and read by the JDK).</li>
+ * <li>{@code handler-references}: the reference handler thread never reads a reference's
+ * referent, so a reference can be shared without its referent.</li>
+ * <li>{@code entry-points}: the VM's calls into the analysis roots (C entry points, JNI, runtime
+ * linkage) pass only objects that are already shared, and don't publish what the roots return or
+ * throw. The analysis injects every object of a parameter's declared type into a root's
+ * parameters; with this assumption, that injection is ignored when a flow is rebuilt.</li>
+ * </ul>
+ * <p>
+ * <b>Classes.</b> {@link FlowReader} says what a flow may hold, also when it saturated.
+ * {@link PublishingSites} turns stores, copies, clones and calls into sites that share what they
+ * move once their target's contents are shared. {@link StoredPlaces} tracks what was stored into a
+ * field or into arrays. {@link SharingExplanation} records why an object is shared, on request.
+ * This class holds the shared sets, the roots and the worklist.
  */
 final class ThreadEscape {
 
-    /** How well the facts describe a method. */
+    /** How completely the facts describe a method. */
     enum Described {
-        /** The facts describe it, or what they can't name stores no reference. */
+        /** Fully, or only with unknown effects that store no reference. */
         WHOLE,
-        /** The facts have the method, but it has an effect or a call they can't name that may store a reference. */
+        /** The method has facts, but an unknown effect or call that may store a reference. */
         UNKNOWN_EFFECT,
-        /** The facts don't have the method at all, such as a native. */
+        /** No facts at all, e.g. a native method. */
         NOTHING
     }
 
     /**
-     * A store of a reference by a node the analysis, when it is conservative about unsafe access,
-     * models by nothing: an unsafe put, a compare-and-swap, an atomic exchange. The flows say what
-     * the object stored into, and the value stored, may be, in the graph of the method as it was
-     * made first; null when the node's input is something no flow was made for.
+     * A reference store that the analysis doesn't model when it is conservative about unsafe accesses:
+     * an unsafe put, a CAS, an atomic exchange. Holds the flows of the target object and of the stored
+     * value (in the method's first graph), or null where no flow exists.
      */
     record UnsafeStore(PointsToAnalysisMethod method, String where, List<TypeFlow<?>> base, List<TypeFlow<?>> value, AnalysisType valueType) {
     }
 
     /**
-     * A call the analysis made no flow for, to code it can't see: a call through a function
-     * pointer, such as the reflective call of a method. The flows say what each argument that is an
-     * object may be, in the graph of the method as it was made first.
+     * A call with no type flow, into code the analysis can't see (a function pointer, a reflective
+     * call). Holds the flows of each object argument, in the method's first graph.
      */
     record OpaqueCall(PointsToAnalysisMethod method, String where, List<List<TypeFlow<?>>> arguments) {
     }
 
-    /** The package of the virtual machine's own classes. */
+    /** The package of the VM's own classes. */
     static final String VM = "com.oracle.svm.";
 
     /**
-     * Parts of the analysis to switch off, as controls: each must break the publication examples,
-     * which shows how much of the answer it decides. Given as
+     * Parts of the analysis to switch off, for testing: each one must break the publication examples,
+     * which shows it matters. Given as
      * {@code -Dsideeffects.controlLeaveOut=static,field,array,copy,handle,opaque,imageheap,summaries}:
-     * a kind of site; {@code imageheap}, which leaves the summaries of the image heap's types out of
-     * the roots; {@code summaries}, which stops a shared summary from sharing every object of its
-     * type.
+     * a kind of site; {@code imageheap} (leave image-heap summaries out of the roots); or
+     * {@code summaries} (a shared summary no longer shares every object of its type).
      */
     static final Set<String> LEAVE_OUT = Set.of(System.getProperty("sideeffects.controlLeaveOut", "").split(","));
 
-    /** The fields of a thread that it keeps to itself by design, for the {@code thread-confined} assumption. */
+    /** Thread fields that by design only the thread itself reads, for {@code thread-confined}. */
     private static final Set<String> THREAD_CONFINED = Set.of("parkBlocker", "threadLocals");
 
-    /** Whether to print how far the work has come ({@code -Dsideeffects.progress=true}). */
+    /** Print progress ({@code -Dsideeffects.progress=true}). */
     static final boolean PROGRESS = Boolean.getBoolean("sideeffects.progress");
 
     final FlowReader reader;
     final StoredPlaces places;
     final PublishingSites sites;
     final SharingExplanation why;
-    /** The types the regular expression names, when asked to explain; otherwise null. */
+    /** Types whose sharing should be explained (a regular expression), or null. */
     final Pattern explain;
 
     final PointsToAnalysis bb;
     final AnalysisUniverse universe;
 
-    /** The assumptions made on top of what the analysis shows, by name. */
+    /** The assumptions in effect, by name. */
     final Set<String> assumptions;
 
-    /** Whether to read what each field's flow says it may hold, beside the stores. */
+    /** Whether to also read what each field's flow says it may hold, in addition to the stores. */
     final boolean readFlows = System.getProperty("sideeffects.readFlows") != null;
 
     final AnalysisType objectType;
@@ -218,53 +187,53 @@ final class ThreadEscape {
     /** Every object some flow of a reachable method may hold. */
     final Set<AnalysisObject> known = new LinkedHashSet<>();
 
-    /** The known objects not shared yet, by their type. */
+    /** Known objects not yet shared, by type. */
     private final Map<AnalysisType, List<AnalysisObject>> unshared = new HashMap<>();
 
-    /** The known objects whose contents are not shared yet, by their type. */
+    /** Known objects whose contents are not yet shared, by type. */
     final Map<AnalysisType, List<AnalysisObject>> uncontained = new HashMap<>();
 
-    /** The objects another thread may reach. */
+    /** Objects another thread may reach. */
     final Set<AnalysisObject> shared = new HashSet<>();
 
-    /** The objects whose contents another thread may reach: the shared ones among them. */
+    /** Objects whose contents another thread may reach (a superset of the shared ones). */
     final Set<AnalysisObject> contents = new HashSet<>();
 
-    /** The shared objects that are shared only for the reference handler thread: their referents are not. */
+    /** References shared only with the reference handler thread; their referents are not shared. */
     private final Set<AnalysisObject> handlerOnly = new HashSet<>();
 
-    /** The summaries shared only because an object they stand for is. */
+    /** Summaries shared only because an object they stand for is. */
     private final Set<AnalysisObject> derivedShared = new HashSet<>();
 
-    /** The summaries with shared contents only because an object they stand for has them. */
+    /** Summaries whose contents are shared only because an object they stand for has shared contents. */
     private final Set<AnalysisObject> derivedContents = new HashSet<>();
 
-    /** The objects shared, or with shared contents, whose consequences are not worked out yet. */
+    /** Worklist: objects newly shared, or with newly shared contents, not processed yet. */
     private final Deque<AnalysisObject> work = new ArrayDeque<>();
 
-    /** The objects whose shared contents were worked out. */
+    /** Objects whose shared contents have been processed. */
     private final Set<AnalysisObject> contentDone = new HashSet<>();
-    /** The shared objects whose sharing was worked out. */
+    /** Shared objects that have been processed. */
     private final Set<AnalysisObject> fullDone = new HashSet<>();
-    /** The objects whose referent, as references, was worked out. */
+    /** References whose referent has been processed. */
     private final Set<AnalysisObject> referentDone = new HashSet<>();
 
-    /** The declared types of the saturated flows that share all their objects. */
+    /** Declared types of saturated flows whose objects are all shared. */
     private final Set<AnalysisType> anyOf = new HashSet<>();
 
-    /** The declared types of the saturated flows that share the contents of all their objects. */
+    /** Declared types of saturated flows whose objects all have shared contents. */
     final Set<AnalysisType> anyContentsOf = new HashSet<>();
 
-    /** The states of the flows reached, by identity: all their objects are shared. */
+    /** Flow states already shared, by identity (the analysis shares one state between many flows). */
     final Set<TypeState> reached = Collections.newSetFromMap(new IdentityHashMap<>());
 
-    /** The exact types some shared object has. */
+    /** Exact types of which some object is shared. */
     private final Set<AnalysisType> sharedTypes = new HashSet<>();
 
-    /** The exact types some object with shared contents has. */
+    /** Exact types of which some object has shared contents. */
     private final Set<AnalysisType> contentTypes = new HashSet<>();
 
-    /** What is done once every site is collected: the calls, static stores and unsafe stores that share outright. */
+    /** Deferred until all sites are collected: the calls, static stores and unsafe stores that share directly. */
     final List<Runnable> afterCollection = new ArrayList<>();
 
     private ThreadEscape(PointsToAnalysis bb, AnalysisUniverse universe, Function<AnalysisMethod, Described> described, boolean compiled, Set<String> assumptions, List<UnsafeStore> unsafeStores,
@@ -286,8 +255,8 @@ final class ThreadEscape {
     }
 
     /**
-     * The names of the shared objects, as {@link GraphExport.PointsTo#objectName} gives them.
-     * {@code described} says how well the facts describe a method, and {@code assumptions}
+     * Returns the names of the shared objects, as {@link GraphExport.PointsTo#objectName} gives them.
+     * {@code described} says how completely the facts describe each method, and {@code assumptions}
      * which assumptions to make.
      */
     static TreeSet<String> sharedObjects(PointsToAnalysis bb, AnalysisUniverse universe, Function<AnalysisMethod, Described> described, boolean compiled, Set<String> assumptions,
@@ -308,7 +277,7 @@ final class ThreadEscape {
         long start = System.nanoTime();
         collectSites();
         start = PointsToExport.step("thread escape: known objects and sites", start);
-        // Every store is known: the sites can say which objects they go into, and what is shared outright can be read.
+        // All stores are known now, so sites can resolve their targets and direct sharing can be applied.
         resolveSites(start);
         start = PointsToExport.step("thread escape: sites and calls resolved", start);
         shareRoots();
@@ -325,7 +294,7 @@ final class ThreadEscape {
         }
     }
 
-    /** Collects every object some flow holds, and makes a site of every store, copy, clone and call of the reachable methods. Nothing is shared yet. */
+    /** Collects every object some flow holds and creates a site for every store, copy, clone and call. Shares nothing yet. */
     private void collectSites() {
         for (AnalysisMethod method : universe.getMethods()) {
             if (!analysed(method)) {
@@ -353,7 +322,7 @@ final class ThreadEscape {
         }
     }
 
-    /** Shares every argument of a call to code the analysis can't see; one without a flow may be any object. */
+    /** Shares every argument of a call into unseen code; an argument without a flow may be any object. */
     private void shareArguments(OpaqueCall call) {
         for (List<TypeFlow<?>> argument : call.arguments()) {
             why.because(() -> "an argument of a call to code the analysis can't see, in " + call.where(), null);
@@ -369,8 +338,8 @@ final class ThreadEscape {
     }
 
     /**
-     * Puts each site under the objects it may go into, now that the stores that tell what a saturated target
-     * holds are all known, and shares what the calls, the static stores and the unsafe stores share outright.
+     * Attaches each site to the objects it may store into (now that all stores, and so all saturated
+     * targets, are known), and applies what calls, static stores and unsafe stores share directly.
      */
     private void resolveSites(long start) {
         int registered = 0;
@@ -387,10 +356,7 @@ final class ThreadEscape {
         afterCollection.clear();
     }
 
-    /**
-     * Shares what every thread reaches: static fields, the image heap, threads and references. Then
-     * sorts the known objects not shared yet by type, for {@link #shareAll}.
-     */
+    /** Shares the roots (static fields, image heap, threads, references), then groups the remaining objects by type for {@link #shareAll}. */
     private void shareRoots() {
         AnalysisType thread = bb.getMetaAccess().lookupJavaType(Thread.class);
         AnalysisType reference = bb.getMetaAccess().lookupJavaType(Reference.class);
@@ -408,9 +374,9 @@ final class ThreadEscape {
     }
 
     /**
-     * What the static fields may hold, as their flows say: every static field when asked to read
-     * the flows, otherwise only those accessed through unsafe, which any unsafe store may write.
-     * Every other store into a static field shares what it stores itself.
+     * What static fields may hold, as their flows say: all static fields when reading field flows,
+     * otherwise only those accessed through unsafe (any unsafe store may write them). Other static
+     * stores share what they store directly.
      */
     private void shareStaticFields() {
         if (readFlows) {
@@ -421,7 +387,7 @@ final class ThreadEscape {
                 }
             }
         } else if (!bb.analysisPolicy().useConservativeUnsafeAccess() && !universe.getUnsafeAccessedStaticFields().isEmpty()) {
-            // The analysis lets every unsafe store write to the static fields accessed through unsafe, whatever it stores into.
+            // The analysis lets every unsafe store write the static fields accessed through unsafe, whatever its target.
             for (AnalysisField field : universe.getUnsafeAccessedStaticFields()) {
                 if (!isPrivate(field) && field instanceof PointsToAnalysisField pointsTo) {
                     why.because(() -> "static field " + field.format("%H.%n") + ", accessed through unsafe", null);
@@ -432,8 +398,8 @@ final class ThreadEscape {
     }
 
     /**
-     * The image heap is what every thread reaches, and the snapshot lists its types. The summary of
-     * such a type stands for those objects, not for what the program allocates of the type.
+     * Every thread can reach the image heap, whose types the snapshot lists. A summary of such a type
+     * stands for the image-heap objects, not for objects the program allocates.
      */
     private void shareImageHeap() {
         if (universe.getHeapScanner() != null && !LEAVE_OUT.contains("imageheap")) {
@@ -449,7 +415,7 @@ final class ThreadEscape {
         }
     }
 
-    /** The image heap's constants, the threads, and the references, which the reference handler thread processes. */
+    /** Shares the image heap's constants, the threads, and the references the reference handler processes. */
     private void shareThreadsAndReferences(AnalysisType thread, AnalysisType reference) {
         for (AnalysisObject object : known) {
             if (object instanceof ConstantContextSensitiveObject || thread.isAssignableFrom(object.type())) {
@@ -466,7 +432,7 @@ final class ThreadEscape {
         }
     }
 
-    /** Spreads sharing from the roots until nothing new is shared: objects, their contents, and the objects of a type once any of them is. */
+    /** Propagates sharing from the roots until nothing changes: objects, their contents, and all objects of a type once any is. */
     private void spread() {
         Set<AnalysisType> expandedShared = new HashSet<>();
         Set<AnalysisType> expandedContents = new HashSet<>();
@@ -489,7 +455,7 @@ final class ThreadEscape {
         } while (!work.isEmpty());
     }
 
-    /** What is done for an object that is shared, or whose contents are. */
+    /** Processes one object that became shared or got shared contents. */
     private void process(AnalysisObject object) {
         if (contentDone.add(object)) {
             contentsOf(object);
@@ -502,7 +468,7 @@ final class ThreadEscape {
         }
     }
 
-    /** The contents of an object are shared: what is stored into it, and what its fields may hold. */
+    /** The object's contents became shared: share what was stored into it and what its fields may hold. */
     private void contentsOf(AnalysisObject object) {
         AnalysisType type = object.type();
         // A summary and the objects it stands for have their contents shared together.
@@ -543,7 +509,7 @@ final class ThreadEscape {
             }
         }
         if (readFlows || !bb.analysisPolicy().aliasArrayTypeFlows()) {
-            // With aliased arrays, all arrays have one elements flow, which holds what was stored into any array.
+            // With aliased arrays, all arrays share one element flow holding whatever was stored into any array.
             ArrayElementsTypeStore elements = type.isArray() && !bb.analysisPolicy().aliasArrayTypeFlows() ? object.getArrayElementsTypeStore() : null;
             if (elements != null && elements.writeFlow() != null) {
                 why.because(() -> "elements", object);
@@ -552,7 +518,7 @@ final class ThreadEscape {
         }
     }
 
-    /** The referent of a reference, which the reference handler thread doesn't read. */
+    /** Shares a reference's referent (which the reference handler doesn't read). */
     private void referentOf(AnalysisObject object) {
         List<Site> into = sites.sitesByObject.get(object);
         if (into != null) {
@@ -568,7 +534,7 @@ final class ThreadEscape {
         }
     }
 
-    /** Fires the sites that go into the object: the stores into a referent, or every other site. */
+    /** Fires the sites that store into the object: stores into a referent, or all other sites. */
     private void fire(List<Site> into, AnalysisObject object, boolean referents) {
         for (Site site : into) {
             boolean intoReferent = site.field != null && isReferent(site.field);
@@ -578,7 +544,7 @@ final class ThreadEscape {
         }
     }
 
-    /** An object is shared: the calls it is passed to share their other arguments. */
+    /** The object became shared: calls it is passed to share their other arguments. */
     private void sharedObject(AnalysisObject object) {
         AnalysisType type = object.type();
         // A summary and the objects it stands for are shared together.
@@ -611,18 +577,18 @@ final class ThreadEscape {
         }
     }
 
-    /** Whether a flow is the virtual machine's, by its source: what it passes on is not what its code stores. */
+    /** Whether a flow comes from VM code: what it passes on is not something program code stores. */
     boolean inVirtualMachine(TypeFlow<?> flow) {
         return assumptions.contains("vm-code") && flow.getSource() instanceof BytecodePosition position && position.getMethod() != null &&
                         position.getMethod().getDeclaringClass().toJavaName(true).startsWith(VM);
     }
 
-    /** Whether a method is the virtual machine's own code, under the {@code vm-code} assumption. */
+    /** Whether a method is VM code, for the {@code vm-code} assumption. */
     boolean inVirtualMachine(AnalysisMethod method) {
         return assumptions.contains("vm-code") && method.getDeclaringClass().toJavaName(true).startsWith(VM);
     }
 
-    /** Whether the field is one that no other thread reads, by an assumption. */
+    /** Whether an assumption says no other thread reads this field. */
     boolean isPrivate(AnalysisField field) {
         if (assumptions.isEmpty()) {
             return false;
@@ -637,7 +603,7 @@ final class ThreadEscape {
         return field.getName().equals("referent") && field.getDeclaringClass().toJavaName(true).equals("java.lang.ref.Reference");
     }
 
-    /** Shares what a held may hold: its objects, any object of its types, and what its places hold. */
+    /** Shares everything a value may hold: its objects, any object of its types, and what its places hold. */
     void share(Held held) {
         for (AnalysisObject object : held.objectsIn(bb)) {
             share(object);
@@ -650,7 +616,7 @@ final class ThreadEscape {
         }
     }
 
-    /** Shares the contents of what a held may hold. */
+    /** Shares the contents of everything a value may hold. */
     void shareContents(Held held) {
         for (AnalysisObject object : held.objectsIn(bb)) {
             shareContents(object);
@@ -667,7 +633,7 @@ final class ThreadEscape {
         }
     }
 
-    /** Shares the known objects of a type and its subtypes, and forgets them: a type is tested once per type of objects, not once per object. */
+    /** Shares the known objects of a type and its subtypes, then drops them from the pending sets, so each type is tested once. */
     private void shareAll(AnalysisType type, Map<AnalysisType, List<AnalysisObject>> buckets, boolean wholly) {
         for (Iterator<Map.Entry<AnalysisType, List<AnalysisObject>>> it = buckets.entrySet().iterator(); it.hasNext();) {
             Map.Entry<AnalysisType, List<AnalysisObject>> objects = it.next();
@@ -678,14 +644,14 @@ final class ThreadEscape {
         }
     }
 
-    /** Whether the analysis reached the method and made its flows. */
+    /** Whether the analysis reached the method and created its flows. */
     static boolean analysed(AnalysisMethod method) {
         return method.isReachable() && method instanceof PointsToAnalysisMethod ptm && ptm.getTypeFlow().flowsGraphCreated();
     }
 
     /**
-     * What a flow may hold is shared; for a saturated flow, any object of its declared type. A
-     * state many flows hold, the analysis keeps once, so it is shared once.
+     * Shares what a flow may hold; for a saturated flow, any object of its declared type. The analysis
+     * shares one state between many flows, so each state is processed once.
      */
     private void reach(TypeFlow<?> flow, AnalysisType declared) {
         if (flow.isSaturated()) {
@@ -705,14 +671,14 @@ final class ThreadEscape {
         }
     }
 
-    /** Any object of the type is shared, once {@link #spread} gets to it. */
+    /** Marks every object of the type as shared; {@link #spread} processes it. */
     void addAnyOf(AnalysisType type) {
         if (anyOf.add(type) && explain != null) {
             why.recordAnyOf(type);
         }
     }
 
-    /** Shares an object, with its contents; a reference shared only for the handler now has its referent shared too. */
+    /** Shares an object and its contents. A reference previously shared only with the handler now has its referent shared too. */
     void share(AnalysisObject object) {
         if (shared.add(object)) {
             contents.add(object);
@@ -721,7 +687,7 @@ final class ThreadEscape {
             }
             work.add(object);
         } else if (handlerOnly.remove(object)) {
-            // Shared for another reason too: its referent is now reachable.
+            // Now shared for another reason too, so its referent is reachable.
             if (explain != null) {
                 why.recordCause(object);
             }
@@ -729,7 +695,7 @@ final class ThreadEscape {
         }
     }
 
-    /** Shares a reference for the reference handler thread, which doesn't read its referent. */
+    /** Shares a reference with the reference handler thread only, without its referent. */
     private void shareForHandler(AnalysisObject object) {
         if (shared.add(object)) {
             contents.add(object);
@@ -741,7 +707,7 @@ final class ThreadEscape {
         }
     }
 
-    /** Shares an object's contents, not the object. */
+    /** Shares an object's contents, but not the object. */
     void shareContents(AnalysisObject object) {
         if (contents.add(object)) {
             if (explain != null) {
