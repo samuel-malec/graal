@@ -41,6 +41,8 @@ import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 import java.util.function.Function;
 
 import org.graalvm.word.LocationIdentity;
@@ -97,31 +99,75 @@ import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 /**
- * Exports what a points-to analysis that has run knows: the facts of every reachable method (the
- * fields it reads and writes, what it allocates, the calls it makes and their targets, the objects
- * each access may touch), and the Graal IR of the program's methods, scheduled, as JSON.
+ * Collects what a finished points-to analysis knows about each reachable method, and optionally
+ * writes it as JSON.
+ * <p>
+ * For every method the export records its <em>facts</em>: the fields and array kinds it reads and
+ * writes, whether it allocates, the targets of its calls, how it synchronizes, and memory effects
+ * that have no name (which make it opaque). For the program's own methods it also records, for
+ * each access, the objects the receiver may point to. Optionally it writes the program's
+ * scheduled Graal IR as well.
+ * <p>
+ * The facts feed the kill sets ({@link KillSetComputation} in the builder, or the Python tool
+ * {@code effects.kills} reading the JSON) and the thread-escape analysis ({@link ThreadEscape}).
  */
 public final class PointsToExport {
 
     private PointsToExport() {
     }
 
-    /** The VM's own locations the facts name, vm:TLAB.top, by name: a feature in the same build gives them back to Graal. */
+    /** VM locations that appear in the facts (e.g. {@code vm:TLAB.top}), by name, so the feature can map names back to Graal locations. */
     public static final Map<String, LocationIdentity> VM_LOCATIONS = new ConcurrentHashMap<>();
 
-    /**
-     * How long each step of the last export took, in nanoseconds: the facts of every reachable method,
-     * the report, thread escape, the program's graphs, and writing the JSON.
-     */
+    /** Time per export step in nanoseconds (facts, report, thread escape, graphs, write) for the last export. */
     public static final Map<String, Long> STEP_NANOS = new ConcurrentHashMap<>();
 
+    /** Per method, what its graph contained when the analysis built its flows; null when not recording. */
+    private static volatile Map<AnalysisMethod, Recorded> recorded;
+
+    /** Time spent recording, summed over the analysis threads. */
+    private static final AtomicLong RECORDING_NANOS = new AtomicLong();
+
     /**
-     * The nodes that kill any location, and so are effects the facts can't name, but store no
-     * reference an object was given: a class's initialization, a transition between Java and
-     * native code, a change of the register that holds the current thread, an identity hash code
-     * written to an object's header, a barrier, a string search. Raw and unsafe stores of
-     * references, atomic updates included, are flows of the analysis, which thread escape
-     * reads as stores; a raw write at an address is not, and links the objects of a call.
+     * Starts recording each method's graph while the analysis builds its type flows, so that the kill
+     * sets can later be computed without decoding every graph a second time (most of the export's
+     * cost). Only used when the kill sets are computed in the builder and thread escape is off. If the
+     * analysis rebuilds a graph, the newer one replaces the older; a method with no recording is
+     * decoded again as usual. Call before the analysis starts.
+     */
+    public static void recordDuringAnalysis(PointsToAnalysis bb) {
+        Map<AnalysisMethod, Recorded> graphs = new ConcurrentHashMap<>();
+        RECORDING_NANOS.set(0);
+        recorded = graphs;
+        bb.setGraphListener((method, graph) -> {
+            long start = System.nanoTime();
+            Recorded found = new Recorded();
+            try {
+                for (Node n : graph.getNodes()) {
+                    scan(n, method.isConstructor(), found);
+                }
+                graphs.put(method, found);
+            } catch (RuntimeException e) {
+                // Don't let a scan failure break the analysis: the export decodes this graph again and reports the problem there.
+                graphs.remove(method);
+            }
+            RECORDING_NANOS.addAndGet(System.nanoTime() - start);
+        });
+    }
+
+    /** Stops recording and drops what was recorded. */
+    public static void stopRecording(PointsToAnalysis bb) {
+        bb.setGraphListener(null);
+        recorded = null;
+    }
+
+    /**
+     * Nodes that kill any location (so they make a method opaque) but never store a reference that
+     * thread escape needs to follow: class initialization, Java/native transitions, writes of the
+     * current-thread register, identity hash codes written into an object header, barriers, string
+     * searches. Raw and unsafe reference stores, atomics included, are type flows of the analysis and
+     * are handled as stores; a raw write to an address is not, and is treated like a call that may
+     * keep its arguments.
      */
     private static final Set<String> STORES_NO_REFERENCE = Set.of("EnsureClassInitializedNode", "CEntryPointEnterNode", "CEntryPointLeaveNode", "CEntryPointUtilityNode",
                     "CFunctionPrologueNode", "CFunctionEpilogueNode", "SubstrateIdentityHashCodeNode", "WriteCurrentVMThreadNode", "WriteHeapBaseNode", "WriteCodeBaseNode",
@@ -129,8 +175,8 @@ public final class PointsToExport {
                     "SubstrateReflectionGetCallerClassNode", "FinalFieldBarrierNode", "SnippetSubstitutionNode", "ForeignCallNode", "RawStoreNode");
 
     /**
-     * How well the facts describe a method: not at all, with an effect or a call they can't name
-     * that may store a reference, or whole.
+     * How completely the facts describe a method: not at all, partially (an unknown effect or call
+     * that may store a reference), or fully.
      */
     private static Function<AnalysisMethod, ThreadEscape.Described> describedBy(Set<String> analysed, TreeMap<String, TreeSet<String>> unknown) {
         return method -> {
@@ -140,20 +186,21 @@ public final class PointsToExport {
             }
             TreeSet<String> effects = unknown.get(key);
             return (effects != null && effects.stream().anyMatch(effect -> !STORES_NO_REFERENCE.contains(effect.replaceFirst(" at bci.*", ""))))
-                            ? ThreadEscape.Described.UNKNOWN_EFFECT : ThreadEscape.Described.WHOLE;
+                            ? ThreadEscape.Described.UNKNOWN_EFFECT
+                            : ThreadEscape.Described.WHOLE;
         };
     }
 
     /**
-     * The assumptions {@code -Dsideeffects.assumptions} names, comma-separated; none without it.
-     * See {@link #export(PointsToAnalysis, AnalysisUniverse, String, String, PrintStream, boolean, String, boolean, Set)}.
+     * The thread-escape assumptions named by {@code -Dsideeffects.assumptions} (comma-separated), or
+     * none. See {@link ThreadEscape} for what each one means.
      */
     public static Set<String> defaultAssumptions() {
         String names = System.getProperty("sideeffects.assumptions", "");
         return names.isEmpty() ? Set.of() : Set.of(names.split(","));
     }
 
-    /** Packages treated as "not the program under analysis" by default. */
+    /** Package prefixes that are not part of the program by default: the JDK, Native Image and Graal. */
     private static final String[] PLATFORM = {
                     "java.", "javax.", "jdk.", "sun.", "com.sun.",
                     "com.oracle.", "org.graalvm.",
@@ -161,8 +208,9 @@ public final class PointsToExport {
     };
 
     /**
-     * Whether a class belongs to the program that {@code prefixes} names: comma-separated
-     * class-name prefixes, none for every class outside the platform's packages, * for all.
+     * Whether a class belongs to the program. {@code prefixes} is a comma-separated list of class-name
+     * prefixes; empty means every class outside the platform packages, and {@code *} means every
+     * class.
      */
     public static boolean isProgramClass(String className, String prefixes) {
         if (prefixes.equals("*")) {
@@ -189,30 +237,28 @@ public final class PointsToExport {
     }
 
     /**
-     * Exports what the analysis knows, as {@link #export(PointsToAnalysis, AnalysisUniverse, String,
-     * String, PrintStream, boolean, String, boolean, Set)} does, with thread escape and the
-     * assumptions {@code -Dsideeffects.assumptions} names.
+     * Runs {@link #export(PointsToAnalysis, AnalysisUniverse, String, String, PrintStream, boolean, String, boolean, Set)}
+     * with thread escape on and the assumptions from {@code -Dsideeffects.assumptions}.
      */
     public static void export(PointsToAnalysis bb, AnalysisUniverse universe, String jsonPath, String irPath, PrintStream report, boolean compiled, String programPrefix) {
         export(bb, universe, jsonPath, irPath, report, compiled, programPrefix, true, defaultAssumptions());
     }
 
     /**
-     * Exports the facts of every reachable method, and the graphs of the program's, from an
-     * analysis that has run: the standalone analyzer's, or Native Image's own, from a feature.
-     * An empty path skips that file; the reports go to {@code report}, null for none.
-     * {@code compiled} says the graphs are about to be compiled into an image, so calls the
-     * analysis found no target for never happen; {@code programPrefix} names the program, as
-     * {@link #isProgramClass(String, String)} takes it.
+     * Collects the facts of every reachable method and writes them (and, if requested, the program's
+     * graphs) as JSON. Works on a finished analysis, either the standalone analyzer's or Native
+     * Image's own. An empty path skips that file; {@code report} receives a human-readable summary,
+     * or null for none.
      * <p>
-     * With {@code threadEscape}, the export works out which objects other threads can reach, and
-     * records the locks and volatile accesses to judge them by. Without it, the facts say only
-     * that a method acquires or releases, and no list of shared objects: the tool then counts every
-     * acquire and release as ordering this thread with another, which is the sound answer without
-     * that knowledge. {@code assumptions} are those thread escape makes on top of what the
-     * analysis shows, by name: {@code thread-confined}, {@code vm-fields}, {@code vm-code},
-     * {@code handler-references} and {@code entry-points}, which {@link ThreadEscape} describes;
-     * none makes the answer follow from the analysis alone.
+     * {@code compiled}: the graphs will be compiled into an image, so a call the analysis found no
+     * target for can never execute. {@code programPrefix}: which classes are the program (see
+     * {@link #isProgramClass(String, String)}).
+     * <p>
+     * With {@code threadEscape}, the export also computes which objects other threads can reach and
+     * records the objects of every lock and volatile access. Without it, the facts only say that a
+     * method acquires or releases, and every acquire and release must be treated as synchronizing
+     * with another thread. {@code assumptions} are extra assumptions for thread escape, described in
+     * {@link ThreadEscape}; with none, the result follows from the analysis alone.
      */
     public static void export(PointsToAnalysis bb, AnalysisUniverse universe, String jsonPath, String irPath, PrintStream report, boolean compiled, String programPrefix,
                     boolean threadEscape, Set<String> assumptions) {
@@ -220,36 +266,46 @@ public final class PointsToExport {
     }
 
     /**
-     * As {@link #export(PointsToAnalysis, AnalysisUniverse, String, String, PrintStream, boolean, String, boolean, Set)},
-     * and with {@code killSets} also works out from the same facts what each method, with
-     * everything it calls, may write, as the tool's effects.kills does with partitions by field:
-     * the lines the tool writes to kills.txt ({@link KillSetComputation}). With both paths empty,
-     * nothing is written and the facts are collected for the kill sets alone. Null without
-     * {@code killSets}.
+     * Like {@link #export(PointsToAnalysis, AnalysisUniverse, String, String, PrintStream, boolean, String, boolean, Set)},
+     * and with {@code killSets} also computes the kill sets ({@link KillSetComputation}) and returns
+     * them as {@code kills.txt} lines; returns null otherwise. With both paths empty nothing is
+     * written. If graphs were recorded during the analysis (see {@link #recordDuringAnalysis}) and
+     * thread escape is off, the kill sets come from the recorded graphs, and graphs are decoded again
+     * only for what is written. A method whose graph fails to decode again is written from its
+     * recorded graph, so the JSON and the builder's kill sets agree.
      */
     public static List<String> export(PointsToAnalysis bb, AnalysisUniverse universe, String jsonPath, String irPath, PrintStream report, boolean compiled, String programPrefix,
                     boolean threadEscape, Set<String> assumptions, boolean killSets) {
         STEP_NANOS.clear();
         SITE_LABEL_COLLISIONS.set(0);
+        NOT_DECODED_AGAIN.set(0);
         long start = System.nanoTime();
         PrintStream out = report != null ? report : new PrintStream(OutputStream.nullOutputStream());
-        // Before any name is made: names are keys, and the keys decide the order things are written in.
+        // Name hidden classes first: names are keys, and keys decide the output order.
         GraphExport.nameHiddenClasses(universe.getTypes(), out);
-        // Each method's facts are its own: they are collected in parallel, and merged into sorted
-        // maps, so the export is the same as one made method by method.
-        Facts found = new Facts();
-        universe.getMethods().parallelStream()
-                        .filter(method -> method.isReachable() && method instanceof PointsToAnalysisMethod ptm && ptm.getTypeFlow().flowsGraphCreated())
-                        .map(method -> collect(bb, (PointsToAnalysisMethod) method, compiled, threadEscape, programPrefix))
-                        .toList()
-                        .forEach(found::merge);
-        if (SITE_LABEL_COLLISIONS.get() > 0) {
-            diagnostics().println("SIDEEFFECT " + SITE_LABEL_COLLISIONS.get() + " locks, volatile accesses or waits had the label of another site in their method; their objects were merged");
+        // Thread escape needs each node's objects, which a recorded graph doesn't keep.
+        Map<AnalysisMethod, Recorded> recordedGraphs = killSets && !threadEscape ? recorded : null;
+        boolean whole = recordedGraphs == null || !jsonPath.isEmpty() || !irPath.isEmpty() || report != null;
+        Facts found = whole ? facts(universe, method -> collect(bb, method, compiled, threadEscape, programPrefix, recordedGraphs)) : null;
+        if (whole) {
+            if (SITE_LABEL_COLLISIONS.get() > 0) {
+                diagnostics().println("SIDEEFFECT " + SITE_LABEL_COLLISIONS.get() + " locks, volatile accesses or waits had the label of another site in their method; their objects were merged");
+            }
+            if (NOT_DECODED_AGAIN.get() > 0) {
+                diagnostics().println("SIDEEFFECT " + NOT_DECODED_AGAIN.get() + " methods had no graph when decoded again after the analysis; their facts are from the graphs the analysis recorded");
+            }
+            start = step("facts", start);
         }
-        start = step("facts", start);
-        TreeMap<String, boolean[]> fields = programFields(universe, programPrefix);
+        Facts forKillSets = recordedGraphs == null ? found
+                        : facts(universe, method -> recordedGraphs.get(method) instanceof Recorded graph ? recalled(method, graph, compiled)
+                                        : collect(bb, method, compiled, threadEscape, programPrefix, recordedGraphs));
+        if (recordedGraphs != null) {
+            STEP_NANOS.put("recording (summed over the analysis' threads)", RECORDING_NANOS.get());
+            start = step("recorded facts", start);
+        }
+        TreeMap<String, boolean[]> fields = whole ? programFields(universe, programPrefix) : null;
         if (report != null) {
-            // Formatted for no one, the report costs PetClinic's build two seconds.
+            // Only build the report when someone reads it: it costs PetClinic's build two seconds.
             printReport(out, found, fields, programPrefix);
         }
         start = step("report", start);
@@ -258,20 +314,15 @@ public final class PointsToExport {
         start = step("thread escape", start);
         List<String> kills = null;
         if (killSets) {
-            kills = KillSetComputation.lines(found, shared);
+            kills = KillSetComputation.lines(forKillSets, shared);
             start = step("kill sets", start);
         }
-        // For evaluation: what each assumption adds, from one analysis.
-        Map<String, TreeSet<String>> byAssumptions = new TreeMap<>();
-        if (threadEscape && System.getProperty("sideeffects.assumptionLayers") != null) {
-            for (String layer : List.of("", "thread-confined", "thread-confined,vm-fields", "thread-confined,vm-fields,vm-code", "thread-confined,vm-fields,vm-code,handler-references",
-                            "thread-confined,vm-fields,vm-code,handler-references,entry-points", "vm-code,entry-points")) {
-                byAssumptions.put(layer.isEmpty() ? "none" : layer, ThreadEscape.sharedObjects(bb, universe, describedBy(found.analysed, found.unknown), compiled,
-                                layer.isEmpty() ? Set.of() : Set.of(layer.split(",")), found.unsafeStores, found.opaqueCalls));
-            }
-        }
-        // Written method by method, and the shared objects one by one: with allocation sites the facts and the shared objects are each longer than
-        // a String can be (2^31 characters).
+        // For evaluation only: the shared objects under each set of assumptions, from one analysis.
+        Map<String, TreeSet<String>> byAssumptions = threadEscape && System.getProperty("sideeffects.assumptionLayers") != null
+                        ? sharedByAssumptions(bb, universe, found, compiled)
+                        : new TreeMap<>();
+        // Written method by method: with allocation-site sensitivity the facts and the shared objects can
+        // each exceed the maximum String length (2^31 characters).
         Content facts = w -> {
             found.writeJson(w, fields);
             if (shared != null) {
@@ -294,14 +345,7 @@ public final class PointsToExport {
         }
 
         if (!irPath.isEmpty()) {
-            List<PointsToAnalysisMethod> methods = new ArrayList<>();
-            for (AnalysisMethod method : universe.getMethods()) {
-                if (method.isReachable() && method instanceof PointsToAnalysisMethod ptm && ptm.getTypeFlow().flowsGraphCreated() &&
-                                isProgramClass(method.getDeclaringClass().toJavaName(true), programPrefix)) {
-                    methods.add(ptm);
-                }
-            }
-            methods.sort(Comparator.comparing(method -> GraphExport.methodName(method) + " " + GraphExport.stable(method.getSignature().toMethodDescriptor())));
+            List<PointsToAnalysisMethod> methods = programMethods(universe, programPrefix);
             GraphExport.ObjectNames objectNames = new GraphExport.ObjectNames(bb);
             List<Map<String, Object>> graphs = new ArrayList<>();
             start = step("write", start);
@@ -309,7 +353,7 @@ public final class PointsToExport {
                 graphs.add(GraphExport.export(bb, method, objectNames));
             }
             start = step("graphs", start);
-            // Written graph by graph: the graphs of a framework are longer than a String can be (2^31 characters).
+            // Written graph by graph: a framework's graphs can exceed the maximum String length.
             write(irPath, w -> {
                 w.write("{\n");
                 facts.writeTo(w);
@@ -324,7 +368,34 @@ public final class PointsToExport {
         return kills;
     }
 
-    /** The program's fields, and whether the analysis found each read and written. */
+    /**
+     * For evaluation: the objects another thread may reach with no assumptions, then with each
+     * assumption added in turn, and with the two that lock elision uses.
+     */
+    private static Map<String, TreeSet<String>> sharedByAssumptions(PointsToAnalysis bb, AnalysisUniverse universe, Facts found, boolean compiled) {
+        Map<String, TreeSet<String>> byAssumptions = new TreeMap<>();
+        for (String layer : List.of("", "thread-confined", "thread-confined,vm-fields", "thread-confined,vm-fields,vm-code", "thread-confined,vm-fields,vm-code,handler-references",
+                        "thread-confined,vm-fields,vm-code,handler-references,entry-points", "vm-code,entry-points")) {
+            byAssumptions.put(layer.isEmpty() ? "none" : layer, ThreadEscape.sharedObjects(bb, universe, describedBy(found.analysed, found.unknown), compiled,
+                            layer.isEmpty() ? Set.of() : Set.of(layer.split(",")), found.unsafeStores, found.opaqueCalls));
+        }
+        return byAssumptions;
+    }
+
+    /** The program's reachable methods with type flows, sorted by name and descriptor (the order graphs are written in). */
+    private static List<PointsToAnalysisMethod> programMethods(AnalysisUniverse universe, String programPrefix) {
+        List<PointsToAnalysisMethod> methods = new ArrayList<>();
+        for (AnalysisMethod method : universe.getMethods()) {
+            if (method.isReachable() && method instanceof PointsToAnalysisMethod ptm && ptm.getTypeFlow().flowsGraphCreated() &&
+                            isProgramClass(method.getDeclaringClass().toJavaName(true), programPrefix)) {
+                methods.add(ptm);
+            }
+        }
+        methods.sort(Comparator.comparing(method -> GraphExport.methodName(method) + " " + GraphExport.stable(method.getSignature().toMethodDescriptor())));
+        return methods;
+    }
+
+    /** The program's fields, each with whether the analysis saw it read and written. */
     private static TreeMap<String, boolean[]> programFields(AnalysisUniverse universe, String programPrefix) {
         TreeMap<String, boolean[]> fields = new TreeMap<>();
         for (AnalysisField f : universe.getFields()) {
@@ -336,10 +407,7 @@ public final class PointsToExport {
         return fields;
     }
 
-    /**
-     * Prints, for people, what the facts say of the program's methods: the fields each reads and
-     * writes, the calls between them, the program's fields, and what the facts can't name.
-     */
+    /** Prints a human-readable summary of the program's methods: fields read and written, calls, and unknown effects. */
     private static void printReport(PrintStream out, Facts found, TreeMap<String, boolean[]> fields, String programPrefix) {
         Set<String> all = new TreeSet<>();
         all.addAll(found.reads.keySet());
@@ -400,19 +468,14 @@ public final class PointsToExport {
         }
     }
 
-    /**
-     * Where the export prints its diagnostics, which scripts read from the build's log: the
-     * standard error, as the builder or the standalone analyzer has it when they are printed.
-     */
+    /** Where diagnostics go (standard error); scripts read them from the build log. */
     static PrintStream diagnostics() {
         // Checkstyle: allow System.err (diagnostics that scripts read from the build's log)
         return System.err;
         // Checkstyle: disallow System.err
     }
 
-    /**
-     * Adds the time since {@code start} to a step of the export, and gives the time it ends at.
-     */
+    /** Adds the time since {@code start} to the named step and returns the current time. */
     static long step(String name, long start) {
         long now = System.nanoTime();
         STEP_NANOS.merge(name, now - start, Long::sum);
@@ -420,124 +483,179 @@ public final class PointsToExport {
     }
 
     /**
-     * The facts of one reachable method whose flows the analysis made, under the method's name.
+     * Collects the facts of every reachable method with type flows, in parallel. Each method's facts
+     * are independent and merged into sorted maps, so the result does not depend on thread order.
      */
-    private static Facts collect(PointsToAnalysis bb, PointsToAnalysisMethod ptm, boolean compiled, boolean threadEscape, String programPrefix) {
-        AnalysisMethod method = ptm;
+    private static Facts facts(AnalysisUniverse universe, Function<PointsToAnalysisMethod, Facts> collector) {
+        Facts found = new Facts();
+        universe.getMethods().parallelStream()
+                        .filter(method -> method.isReachable() && method instanceof PointsToAnalysisMethod ptm && ptm.getTypeFlow().flowsGraphCreated())
+                        .map(method -> collector.apply((PointsToAnalysisMethod) method))
+                        .toList()
+                        .forEach(found::merge);
+        return found;
+    }
+
+    /** The facts the kill sets need for one method, replayed from the graph recorded during the analysis. */
+    private static Facts recalled(PointsToAnalysisMethod ptm, Recorded graph, boolean compiled) {
         Facts f = new Facts();
-        String name = GraphExport.methodKey(method);
-        if (isProgramClass(method.getDeclaringClass().toJavaName(true), programPrefix)) {
-            f.program.add(name);
+        String name = GraphExport.methodKey(ptm);
+        f.analysed.add(name);
+        graph.replay(new Named(f, name, GraphExport.flows(ptm), compiled));
+        flowFacts(ptm, name, f);
+        return f;
+    }
+
+    /**
+     * Collects one method's facts. If its graph cannot be decoded again after the analysis but was
+     * recorded ({@code recordedGraphs}, null when not recording), the recorded graph is used instead.
+     */
+    private static Facts collect(PointsToAnalysis bb, PointsToAnalysisMethod ptm, boolean compiled, boolean threadEscape, String programPrefix, Map<AnalysisMethod, Recorded> recordedGraphs) {
+        return new Collector(bb, ptm, compiled, threadEscape, programPrefix).collect(recordedGraphs);
+    }
+
+    /** Collects one method's facts: first from its graph, node by node, then from its type flows. */
+    private static final class Collector {
+        private final PointsToAnalysis bb;
+        private final PointsToAnalysisMethod ptm;
+        private final boolean compiled;
+        private final boolean threadEscape;
+        private final String name;
+        private final Facts f = new Facts();
+
+        /**
+         * The type flows of the method's invokes, by call site. An invoke inlined before the analysis
+         * shares the flow of its outermost call site with other invokes, so they are told apart by
+         * target.
+         */
+        private Map<String, List<InvokeTypeFlow>> flows;
+        /**
+         * Resolves what an access's receiver may point to; only for the program's own methods. Elsewhere
+         * an access is assumed to touch any object with that field or of that array kind.
+         */
+        private GraphExport.PointsTo pointsTo;
+        /** The same, for locks and thread escape in any method; created lazily by {@link #synchronizedOn}. */
+        private GraphExport.PointsTo synchronizedOn;
+
+        Collector(PointsToAnalysis bb, PointsToAnalysisMethod ptm, boolean compiled, boolean threadEscape, String programPrefix) {
+            this.bb = bb;
+            this.ptm = ptm;
+            this.compiled = compiled;
+            this.threadEscape = threadEscape;
+            this.name = GraphExport.methodKey(ptm);
+            if (isProgramClass(ptm.getDeclaringClass().toJavaName(true), programPrefix)) {
+                f.program.add(name);
+            }
         }
 
-        StructuredGraph body;
-        try {
-            body = GraphExport.analysisGraph(bb, ptm);
-        } catch (VirtualMachineError e) {
-            throw e;
-        } catch (Throwable t) {
-            // Decoding a graph again after the analysis fails where a plugin only runs before
-            // Native Image seals its registries: then the method may touch anything.
-            add(f.unknown, name, "no graph after the analysis (" + GraphExport.simpleClassName(t) + ")");
-            body = null;
-        }
-        if (body != null) {
-            f.analysed.add(name);
-            // An invoke inlined before the analysis has its flow at the outermost call
-            // site, which more than one invoke may share: they are told apart by target.
-            Map<String, List<InvokeTypeFlow>> flows = GraphExport.flows(ptm);
-            // What each access's receiver may point to, for the program's
-            // own methods: a field or array access elsewhere may touch any
-            // object with the field or of the kind.
-            GraphExport.PointsTo pointsTo = f.program.contains(name) ? new GraphExport.PointsTo(bb, ptm) : null;
-            GraphExport.PointsTo synchronizedOn = pointsTo; // made on the first synchronization of a method outside the program
-            for (Node n : body.getNodes()) {
-                String at = " at bci " + (n instanceof ValueNode value ? GraphExport.bci(value) : -1);
-                ValueNode[] unsafeStore = threadEscape ? unsafeStore(n) : null;
-                if (unsafeStore != null) {
-                    // The analysis, when it is conservative about unsafe access, models nothing of these stores.
-                    synchronizedOn = synchronizedOn != null ? synchronizedOn : new GraphExport.PointsTo(bb, ptm);
-                    f.unsafeStores.add(new ThreadEscape.UnsafeStore(ptm, name + at, synchronizedOn.flowsOf(unsafeStore[0]), synchronizedOn.flowsOf(unsafeStore[1]),
-                                    (AnalysisType) StampTool.typeOrNull(unsafeStore[1], bb.getMetaAccess())));
-                }
-                if (n instanceof AccessFieldNode access) {
-                    String field = GraphExport.fieldName(access.field());
-                    add(access instanceof LoadFieldNode ? f.reads : f.writes, name, field);
-                    if (pointsTo != null) {
-                        addAccess(f.accesses, name, access instanceof LoadFieldNode ? "read" : "write", field, pointsTo.receivers(access), access);
-                    }
-                    if (access.ordersMemoryAccesses()) {
-                        // A volatile read acquires, a volatile write releases.
-                        String what = "volatile " + (access instanceof LoadFieldNode ? "read of " : "write of ") + field + at;
-                        add(access instanceof LoadFieldNode ? f.acquires : f.releases, name, what);
-                        if (threadEscape) {
-                            synchronizedOn = synchronizedOn != null ? synchronizedOn : new GraphExport.PointsTo(bb, ptm);
-                            putSite(f.locks.computeIfAbsent(name, k -> new TreeMap<>()), what, synchronizedOn.receivers(access));
-                        }
-                    }
-                } else if (n instanceof AccessIndexedNode access) {
-                    add(access instanceof LoadIndexedNode ? f.reads : f.writes, name, GraphExport.arrayPartition(access.elementKind()));
-                    if (pointsTo != null) {
-                        addAccess(f.accesses, name, access instanceof LoadIndexedNode ? "read" : "write", GraphExport.arrayPartition(access.elementKind()), pointsTo.receivers(access), access);
-                    }
-                } else if (n instanceof BasicArrayCopyNode copy && copy.getElementKind() != null) {
-                    add(f.reads, name, GraphExport.arrayPartition(copy.getElementKind()));
-                    add(f.writes, name, GraphExport.arrayPartition(copy.getElementKind()));
-                    if (pointsTo != null) {
-                        addAccess(f.accesses, name, "read", GraphExport.arrayPartition(copy.getElementKind()), pointsTo.objects(copy.getSource()), copy);
-                        addAccess(f.accesses, name, "write", GraphExport.arrayPartition(copy.getElementKind()), pointsTo.objects(copy.getDestination()), copy);
-                    }
-                } else if (n instanceof BasicArrayCopyNode) {
-                    // An element kind Graal can't tell, so it says the copy kills anything.
-                    // System.arraycopy writes the elements of an array, of some kind, and
-                    // never a field.
-                    for (JavaKind kind : List.of(JavaKind.Byte, JavaKind.Char, JavaKind.Short, JavaKind.Int, JavaKind.Long, JavaKind.Float, JavaKind.Double, JavaKind.Object)) {
-                        add(f.reads, name, GraphExport.arrayPartition(kind));
-                        add(f.writes, name, GraphExport.arrayPartition(kind));
-                    }
-                } else if (n instanceof AbstractNewObjectNode || n instanceof CommitAllocationNode) {
-                    f.allocates.add(name);
-                } else if (n instanceof ObjectClone) {
-                    // Graal says a clone kills anything; it writes the object it makes, which
-                    // no caller can have read, and reads all of the one it copies.
-                    f.allocates.add(name);
-                    add(f.unknownReads, name, GraphExport.simpleClassName(n) + at);
-                } else if (n instanceof Invoke invoke) {
-                    if (threadEscape && invoke.callTarget() != null && invoke.getTargetMethod() != null && isMonitorQuery(invoke.getTargetMethod()) && !invoke.callTarget().arguments().isEmpty()) {
-                        synchronizedOn = synchronizedOn != null ? synchronizedOn : new GraphExport.PointsTo(bb, ptm);
-                        putSite(f.waits.computeIfAbsent(name, k -> new TreeMap<>()), invoke.getTargetMethod().getName() + at, synchronizedOn.objects(invoke.callTarget().arguments().get(0)));
-                    }
-                    // No flow, a disabled one or one without callees: the analysis found no target.
-                    List<InvokeTypeFlow> found = flows.get(GraphExport.flowKey(invoke));
-                    String why = found == null ? "no flow"
-                                    : found.stream().noneMatch(InvokeTypeFlow::isFlowEnabled) ? "disabled"
-                                                    : found.stream().allMatch(flow -> flow.getOriginalCallees().isEmpty()) ? "no callees" : null;
-                    if (why != null) {
-                        add(compiled && found != null ? f.dead : f.unresolved, name, GraphExport.methodKey(invoke.getTargetMethod()) + at + " (" + why + ")");
-                    }
-                    if (threadEscape && found == null && invoke.callTarget() != null) {
-                        // Code the analysis can't see, a call through a function pointer: it may keep every object it is given.
-                        synchronizedOn = synchronizedOn != null ? synchronizedOn : new GraphExport.PointsTo(bb, ptm);
-                        List<List<TypeFlow<?>>> arguments = new ArrayList<>();
-                        for (ValueNode argument : invoke.callTarget().arguments()) {
-                            if (argument.getStackKind() == JavaKind.Object) {
-                                arguments.add(synchronizedOn.flowsOf(argument));
-                            }
-                        }
-                        f.opaqueCalls.add(new ThreadEscape.OpaqueCall(ptm, name + at, arguments));
-                    }
-                } else if (n instanceof FinalFieldBarrierNode && ptm.isConstructor()) {
-                    // Ordered by the reference: the translation has a constructor
-                    // return its receiver, and every later use take that.
-                } else if ((MemoryKill.isMemoryKill(n) || n instanceof MemoryAccess) && !isBookkeeping(n)) {
-                    effects(n, name, GraphExport.simpleClassName(n) + at, f);
-                    if (threadEscape && n instanceof AccessMonitorNode monitor) {
-                        synchronizedOn = synchronizedOn != null ? synchronizedOn : new GraphExport.PointsTo(bb, ptm);
-                        putSite(f.locks.computeIfAbsent(name, k -> new TreeMap<>()), GraphExport.simpleClassName(n) + at, synchronizedOn.objects(monitor.object()));
+        Facts collect(Map<AnalysisMethod, Recorded> recordedGraphs) {
+            StructuredGraph body;
+            String failure = null;
+            try {
+                body = GraphExport.analysisGraph(bb, ptm);
+            } catch (VirtualMachineError e) {
+                throw e;
+            } catch (Throwable t) {
+                failure = GraphExport.simpleClassName(t);
+                body = null;
+            }
+            if (body == null && recordedGraphs != null && recordedGraphs.get(ptm) instanceof Recorded graph) {
+                // Use the graph the analysis built the flows from, replayed as in recalled(), so the JSON has the
+                // same facts as the builder's kill sets.
+                NOT_DECODED_AGAIN.incrementAndGet();
+                f.analysed.add(name);
+                graph.replay(new Named(f, name, GraphExport.flows(ptm), compiled));
+            } else if (failure != null) {
+                // Decoding fails when a plugin only works before Native Image seals its registries. Without a
+                // graph the method may touch anything.
+                add(f.unknown, name, "no graph after the analysis (" + failure + ")");
+            }
+            if (body != null) {
+                f.analysed.add(name);
+                flows = GraphExport.flows(ptm);
+                Named found = new Named(f, name, flows, compiled);
+                pointsTo = f.program.contains(name) ? new GraphExport.PointsTo(bb, ptm) : null;
+                synchronizedOn = pointsTo;
+                for (Node n : body.getNodes()) {
+                    scan(n, ptm.isConstructor(), found);
+                    if (threadEscape || pointsTo != null) {
+                        objects(n);
                     }
                 }
             }
+            flowFacts(ptm, name, f);
+            return f;
         }
+
+        /** Resolves the objects of locks, unsafe stores and opaque calls in methods outside the program; created on first use. */
+        private GraphExport.PointsTo synchronizedOn() {
+            if (synchronizedOn == null) {
+                synchronizedOn = new GraphExport.PointsTo(bb, ptm);
+            }
+            return synchronizedOn;
+        }
+
+        /** Records what scan() doesn't: the objects of accesses and locks. Must test the same node kinds in the same order as scan(). */
+        private void objects(Node n) {
+            ValueNode[] unsafeStore = threadEscape ? unsafeStore(n) : null;
+            if (unsafeStore != null) {
+                // When the analysis is conservative about unsafe accesses, it doesn't model these stores at all.
+                f.unsafeStores.add(new ThreadEscape.UnsafeStore(ptm, name + at(n), synchronizedOn().flowsOf(unsafeStore[0]), synchronizedOn().flowsOf(unsafeStore[1]),
+                                (AnalysisType) StampTool.typeOrNull(unsafeStore[1], bb.getMetaAccess())));
+            }
+            if (n instanceof AccessFieldNode access) {
+                String field = GraphExport.fieldName(access.field());
+                if (pointsTo != null) {
+                    addAccess(f.accesses, name, access instanceof LoadFieldNode ? "read" : "write", field, pointsTo.receivers(access), access);
+                }
+                if (access.ordersMemoryAccesses() && threadEscape) {
+                    String what = "volatile " + (access instanceof LoadFieldNode ? "read of " : "write of ") + field + at(n);
+                    putSite(f.locks.computeIfAbsent(name, k -> new TreeMap<>()), what, synchronizedOn().receivers(access));
+                }
+            } else if (n instanceof AccessIndexedNode access) {
+                if (pointsTo != null) {
+                    addAccess(f.accesses, name, access instanceof LoadIndexedNode ? "read" : "write", GraphExport.arrayPartition(access.elementKind()), pointsTo.receivers(access), access);
+                }
+            } else if (n instanceof BasicArrayCopyNode copy) {
+                if (pointsTo != null && copy.getElementKind() != null) {
+                    addAccess(f.accesses, name, "read", GraphExport.arrayPartition(copy.getElementKind()), pointsTo.objects(copy.getSource()), copy);
+                    addAccess(f.accesses, name, "write", GraphExport.arrayPartition(copy.getElementKind()), pointsTo.objects(copy.getDestination()), copy);
+                }
+            } else if (n instanceof AbstractNewObjectNode || n instanceof CommitAllocationNode || n instanceof ObjectClone) {
+                // scan() handles allocations.
+            } else if (n instanceof Invoke invoke) {
+                invoke(invoke, at(n));
+            } else if (n instanceof FinalFieldBarrierNode && ptm.isConstructor()) {
+                // As in scan().
+            } else if (threadEscape && n instanceof AccessMonitorNode monitor && (MemoryKill.isMemoryKill(n) || n instanceof MemoryAccess) && !isBookkeeping(n)) {
+                putSite(f.locks.computeIfAbsent(name, k -> new TreeMap<>()), GraphExport.simpleClassName(n) + at(n), synchronizedOn().objects(monitor.object()));
+            }
+        }
+
+        /** Records calls that query or wait on a monitor, and calls into code the analysis can't see. */
+        private void invoke(Invoke invoke, String at) {
+            if (threadEscape && invoke.callTarget() != null && invoke.getTargetMethod() != null && isMonitorQuery(invoke.getTargetMethod()) && !invoke.callTarget().arguments().isEmpty()) {
+                putSite(f.waits.computeIfAbsent(name, k -> new TreeMap<>()), invoke.getTargetMethod().getName() + at, synchronizedOn().objects(invoke.callTarget().arguments().get(0)));
+            }
+            if (threadEscape && flows.get(GraphExport.flowKey(invoke)) == null && invoke.callTarget() != null) {
+                // A call into unseen code, e.g. through a function pointer: it may keep any object passed to it.
+                GraphExport.PointsTo objects = synchronizedOn();
+                List<List<TypeFlow<?>>> arguments = new ArrayList<>();
+                for (ValueNode argument : invoke.callTarget().arguments()) {
+                    if (argument.getStackKind() == JavaKind.Object) {
+                        arguments.add(objects.flowsOf(argument));
+                    }
+                }
+                f.opaqueCalls.add(new ThreadEscape.OpaqueCall(ptm, name + at, arguments));
+            }
+        }
+    }
+
+    /**
+     * Adds what a method's type flows show beyond its graph: the fields loaded and stored, and the
+     * resolved call targets (every target the analysis considers possible for a virtual call).
+     */
+    private static void flowFacts(PointsToAnalysisMethod ptm, String name, Facts f) {
         MethodFlowsGraph graph = ptm.getTypeFlow().getMethodFlowsGraph();
         for (TypeFlow<?> flow : graph.flows()) {
             if (flow instanceof AccessFieldTypeFlow access) {
@@ -551,26 +669,252 @@ public final class PointsToExport {
             }
         }
 
-        // The call graph, points-to resolved: a virtual call yields every
-        // target the analysis considers possible, not just the declared one.
         for (InvokeTypeFlow invoke : graph.getInvokes()) {
             for (AnalysisMethod callee : invoke.getOriginalCallees()) {
                 String target = GraphExport.methodKey(callee);
                 f.callees.computeIfAbsent(name, k -> new TreeSet<>()).add(target);
             }
         }
-        return f;
     }
 
-    /** How many sites had the label of another site of their method, and had their objects merged with it. */
-    private static final AtomicInteger SITE_LABEL_COLLISIONS = new AtomicInteger();
+    /**
+     * Reports what one node does to memory: field and array reads and writes, allocation, calls,
+     * synchronization, and the locations any other memory node kills or reads (as Graal declares
+     * them). The node is not named here; {@code found} names it, now or after the analysis.
+     */
+    private static void scan(Node n, boolean constructor, Scanned found) {
+        if (n instanceof AccessFieldNode access) {
+            found.field(access.field(), access instanceof LoadFieldNode, access.ordersMemoryAccesses(), bci(n));
+        } else if (n instanceof AccessIndexedNode access) {
+            found.elements(access.elementKind(), access instanceof LoadIndexedNode);
+        } else if (n instanceof BasicArrayCopyNode copy && copy.getElementKind() != null) {
+            found.elements(copy.getElementKind(), true);
+            found.elements(copy.getElementKind(), false);
+        } else if (n instanceof BasicArrayCopyNode) {
+            // Graal can't tell the element kind, so it says the copy kills anything. But System.arraycopy
+            // only writes array elements, never a field: record a read and a write of every kind.
+            for (JavaKind kind : List.of(JavaKind.Byte, JavaKind.Char, JavaKind.Short, JavaKind.Int, JavaKind.Long, JavaKind.Float, JavaKind.Double, JavaKind.Object)) {
+                found.elements(kind, true);
+                found.elements(kind, false);
+            }
+        } else if (n instanceof AbstractNewObjectNode || n instanceof CommitAllocationNode) {
+            found.allocates();
+        } else if (n instanceof ObjectClone) {
+            // Graal says a clone kills anything. It writes only the new object, which no caller can have
+            // read, and reads all of the original.
+            found.allocates();
+            found.unknownRead(GraphExport.simpleClassName(n), bci(n));
+        } else if (n instanceof Invoke invoke) {
+            found.call(GraphExport.flowBci(invoke), invoke.getTargetMethod(), bci(n));
+        } else if (n instanceof FinalFieldBarrierNode && constructor) {
+            // Ordering is carried by the reference: the token-form translation has a constructor return
+            // its receiver, and later uses take that value.
+        } else if ((MemoryKill.isMemoryKill(n) || n instanceof MemoryAccess) && !isBookkeeping(n)) {
+            effects(n, found);
+        }
+    }
+
+    /** The node's innermost bytecode index, or -1. */
+    private static int bci(Node n) {
+        return n instanceof ValueNode value ? GraphExport.bci(value) : -1;
+    }
+
+    /** The node's position as used in fact labels: " at bci N". */
+    private static String at(Node n) {
+        return at(bci(n));
+    }
+
+    private static String at(int bci) {
+        return " at bci " + bci;
+    }
+
+    /** Receives what {@link #scan} finds in a node, before anything is named. */
+    private interface Scanned {
+        /** A field read or write; {@code ordered} for a volatile access. */
+        void field(ResolvedJavaField field, boolean read, boolean ordered, int bci);
+
+        /** A read or write of array elements of one kind. */
+        void elements(JavaKind kind, boolean read);
+
+        void allocates();
+
+        /** A call, by its outermost call site in the flows ({@link GraphExport#flowBci}) and its target. */
+        void call(int flowBci, ResolvedJavaMethod target, int bci);
+
+        /** A node that synchronizes, by its class's simple name. */
+        void synchronizes(String node, int bci, boolean acquires, boolean releases);
+
+        /** A node that may kill any location. */
+        void unknown(String node, int bci);
+
+        void kills(LocationIdentity location);
+
+        void reads(LocationIdentity location);
+
+        /** A node that may read any location. */
+        void unknownRead(String node, int bci);
+    }
+
+    /** Records what {@link #scan} finds into one method's facts, checking each call against the method's final type flows. */
+    private static final class Named implements Scanned {
+        private final Facts f;
+        private final String method;
+        private final Map<String, List<InvokeTypeFlow>> flows;
+        private final boolean compiled;
+
+        Named(Facts f, String method, Map<String, List<InvokeTypeFlow>> flows, boolean compiled) {
+            this.f = f;
+            this.method = method;
+            this.flows = flows;
+            this.compiled = compiled;
+        }
+
+        @Override
+        public void field(ResolvedJavaField field, boolean read, boolean ordered, int bci) {
+            String name = GraphExport.fieldName(field);
+            add(read ? f.reads : f.writes, method, name);
+            if (ordered) {
+                // A volatile read is an acquire, a volatile write a release.
+                add(read ? f.acquires : f.releases, method, "volatile " + (read ? "read of " : "write of ") + name + at(bci));
+            }
+        }
+
+        @Override
+        public void elements(JavaKind kind, boolean read) {
+            add(read ? f.reads : f.writes, method, GraphExport.arrayPartition(kind));
+        }
+
+        @Override
+        public void allocates() {
+            f.allocates.add(method);
+        }
+
+        @Override
+        public void call(int flowBci, ResolvedJavaMethod target, int bci) {
+            // No flow, a disabled flow, or no callees: the analysis found no target.
+            List<InvokeTypeFlow> found = flows.get(GraphExport.flowKey(flowBci, target));
+            String why = found == null ? "no flow"
+                            : found.stream().noneMatch(InvokeTypeFlow::isFlowEnabled) ? "disabled"
+                                            : found.stream().allMatch(flow -> flow.getOriginalCallees().isEmpty()) ? "no callees" : null;
+            if (why != null) {
+                add(compiled && found != null ? f.dead : f.unresolved, method, GraphExport.methodKey(target) + at(bci) + " (" + why + ")");
+            }
+        }
+
+        @Override
+        public void synchronizes(String node, int bci, boolean acquires, boolean releases) {
+            if (acquires) {
+                add(f.acquires, method, node + at(bci));
+            }
+            if (releases) {
+                add(f.releases, method, node + at(bci));
+            }
+        }
+
+        @Override
+        public void unknown(String node, int bci) {
+            add(f.unknown, method, node + at(bci));
+        }
+
+        @Override
+        public void kills(LocationIdentity location) {
+            if (location.isInit()) {
+                f.allocates.add(method);
+            } else if (location(location) instanceof String written) {
+                add(written.startsWith("vm:") ? f.vmWrites : f.writes, method, written);
+            }
+        }
+
+        @Override
+        public void reads(LocationIdentity location) {
+            if (!location.isInit() && location(location) instanceof String read && !read.startsWith("vm:")) {
+                add(f.reads, method, read);
+            }
+        }
+
+        @Override
+        public void unknownRead(String node, int bci) {
+            add(f.unknownReads, method, node + at(bci));
+        }
+    }
 
     /**
-     * Records the objects a lock, a volatile access or a wait may be on, under its label. The label names
-     * the node's innermost bytecode index only, so two nodes of one graph can have the same one: a
-     * method's own lock and one inlined into it before the analysis, both at index 0. Both are kept, and
-     * the objects are unknown if they are for either, so that a site is judged by everything that shares
-     * its label: a lock on shared objects must not be judged by the thread-local ones next to it.
+     * Keeps what {@link #scan} found in a graph during the analysis, by reference, to be replayed
+     * later when names are stable and the flows are final. Keeps only what the kill sets need, so no
+     * plain reads.
+     */
+    private static final class Recorded implements Scanned {
+        private final ArrayList<Consumer<Scanned>> found = new ArrayList<>();
+        private boolean allocates;
+
+        @Override
+        public void field(ResolvedJavaField field, boolean read, boolean ordered, int bci) {
+            if (!read || ordered) {
+                found.add(to -> to.field(field, read, ordered, bci));
+            }
+        }
+
+        @Override
+        public void elements(JavaKind kind, boolean read) {
+            if (!read) {
+                found.add(to -> to.elements(kind, false));
+            }
+        }
+
+        @Override
+        public void allocates() {
+            allocates = true;
+        }
+
+        @Override
+        public void call(int flowBci, ResolvedJavaMethod target, int bci) {
+            found.add(to -> to.call(flowBci, target, bci));
+        }
+
+        @Override
+        public void synchronizes(String node, int bci, boolean acquires, boolean releases) {
+            found.add(to -> to.synchronizes(node, bci, acquires, releases));
+        }
+
+        @Override
+        public void unknown(String node, int bci) {
+            found.add(to -> to.unknown(node, bci));
+        }
+
+        @Override
+        public void kills(LocationIdentity location) {
+            found.add(to -> to.kills(location));
+        }
+
+        @Override
+        public void reads(LocationIdentity location) {
+        }
+
+        @Override
+        public void unknownRead(String node, int bci) {
+        }
+
+        /** Replays the recorded findings into {@code to}, in the order scan found them. */
+        void replay(Scanned to) {
+            if (allocates) {
+                to.allocates();
+            }
+            found.forEach(event -> event.accept(to));
+        }
+    }
+
+    /** Sites whose label collided with another site in the same method, so their objects were merged. */
+    private static final AtomicInteger SITE_LABEL_COLLISIONS = new AtomicInteger();
+
+    /** Methods written from their recorded graph because their graph failed to decode again. */
+    private static final AtomicInteger NOT_DECODED_AGAIN = new AtomicInteger();
+
+    /**
+     * Records the objects a lock, volatile access or wait may be on, under the site's label. The label
+     * uses only the innermost bytecode index, so two nodes of one graph can share it (for example a
+     * method's own lock and one inlined into it, both at bci 0). Both are kept, and the objects are
+     * unknown if either's are, so a lock on shared objects is never judged by a thread-local one with
+     * the same label.
      */
     @SuppressWarnings("unchecked")
     private static void putSite(TreeMap<String, Object> sites, String label, List<String> receivers) {
@@ -589,7 +933,7 @@ public final class PointsToExport {
         sites.put(label, new ArrayList<>(both));
     }
 
-    /** Whether a call asks about a monitor: waits or notifies on an object, or asks whether the thread holds it. */
+    /** Whether the call waits on, notifies, or asks whether the thread holds an object's monitor. */
     private static boolean isMonitorQuery(ResolvedJavaMethod method) {
         String owner = method.getDeclaringClass().toJavaName(true);
         String name = method.getName();
@@ -597,10 +941,7 @@ public final class PointsToExport {
                         owner.equals("java.lang.Thread") && name.equals("holdsLock");
     }
 
-    /**
-     * The object and the value of a node that stores a reference at an offset: an unsafe put, a
-     * compare-and-swap, an exchange; null for any other node.
-     */
+    /** For a node that stores a reference at an offset (unsafe put, CAS, exchange): the object and the value; null otherwise. */
     private static ValueNode[] unsafeStore(Node n) {
         if (n instanceof RawStoreNode store && store.value().getStackKind() == JavaKind.Object) {
             return new ValueNode[]{store.object(), store.value()};
@@ -612,9 +953,7 @@ public final class PointsToExport {
         return null;
     }
 
-    /**
-     * The facts of one method, or of all of them once merged, each under the method's name.
-     */
+    /** The facts of one method, or of all methods once merged, keyed by method name. */
     static final class Facts {
         final TreeMap<String, TreeSet<String>> reads = new TreeMap<>();
         final TreeMap<String, TreeSet<String>> writes = new TreeMap<>();
@@ -625,11 +964,11 @@ public final class PointsToExport {
         final TreeMap<String, TreeSet<String>> unknown = new TreeMap<>();
         final TreeMap<String, TreeSet<String>> acquires = new TreeMap<>();
         final TreeMap<String, TreeSet<String>> releases = new TreeMap<>();
-        // For each method, the objects each of its acquires and releases synchronizes on, where
-        // the analysis can name them: a lock's object, a volatile field's receivers.
+        // Per method: the objects each acquire and release synchronizes on, where the analysis can name
+        // them (a lock's object, a volatile field's receivers).
         final TreeMap<String, TreeMap<String, Object>> locks = new TreeMap<>();
-        // For each method, the objects its calls to wait, notify, notifyAll and holdsLock are on, where the
-        // analysis can name them: an object that is waited on needs its monitor held.
+        // Per method: the objects its wait, notify, notifyAll and holdsLock calls are on, where the
+        // analysis can name them. An object that is waited on must keep its monitor.
         final TreeMap<String, TreeMap<String, Object>> waits = new TreeMap<>();
         final TreeMap<String, TreeSet<String>> unresolved = new TreeMap<>();
         final TreeMap<String, TreeSet<String>> accesses = new TreeMap<>();
@@ -655,10 +994,7 @@ public final class PointsToExport {
             other.waits.forEach((m, sites) -> waits.computeIfAbsent(m, k -> new TreeMap<>()).putAll(sites));
         }
 
-        /**
-         * Writes the facts as the export's "methods" and "fields", one method and one field at a
-         * time.
-         */
+        /** Writes the facts as the JSON "methods" and "fields", one entry at a time. */
         void writeJson(Writer out, TreeMap<String, boolean[]> fields) throws IOException {
             Set<String> allMethods = new TreeSet<>(analysed);
             allMethods.addAll(callees.keySet());
@@ -716,63 +1052,51 @@ public final class PointsToExport {
         }
     }
 
-
     /**
-     * Nodes that kill or read memory for Graal's bookkeeping only: the state at
-     * the method's start and at a handler's, the creation of an exception on a
-     * path that throws, and an array's length, which never changes.
+     * Nodes that kill or read memory only for Graal's bookkeeping: the start and handler-entry states,
+     * creating an exception on a throwing path, and an array length (which never changes).
      */
     private static boolean isBookkeeping(Node n) {
         return n instanceof StartNode || n instanceof ExceptionObjectNode || n instanceof BytecodeExceptionNode || n instanceof ArrayLengthNode;
     }
 
     /**
-     * A memory node the facts don't model one by one, by what Graal says it does: the locations
-     * it kills, and the one it reads. Synchronization (an ordered access, a lock, a fence, an
-     * atomic update) is an acquire, a release or both, which Graal says kills any location; any
-     * other kill of any location may touch anything; a read of any location may read anything,
-     * which matters to the tokens but not to what a call may write.
+     * Handles any other memory node by what Graal declares it kills and reads. Synchronization (an
+     * ordered access, a lock, a fence, an atomic update) becomes an acquire, a release or both. Any
+     * other kill of any location is an unknown effect. A read of any location is recorded too: it
+     * matters to the token form, not to what a call may write.
      */
-    private static void effects(Node n, String method, String what, Facts f) {
+    private static void effects(Node n, Scanned found) {
         Synchronization synchronization = synchronization(n);
         if (synchronization != null) {
-            if (synchronization.acquires()) {
-                add(f.acquires, method, what);
-            }
-            if (synchronization.releases()) {
-                add(f.releases, method, what);
-            }
+            found.synchronizes(GraphExport.simpleClassName(n), bci(n), synchronization.acquires(), synchronization.releases());
             return;
         }
         if (MemoryKill.isMemoryKill(n)) {
             LocationIdentity[] killed = MemoryKill.isMultiMemoryKill(n) ? MemoryKill.asMultiMemoryKill(n).getKilledLocationIdentities()
                             : new LocationIdentity[]{MemoryKill.asSingleMemoryKill(n).getKilledLocationIdentity()};
             if (Arrays.stream(killed).anyMatch(LocationIdentity::isAny)) {
-                add(f.unknown, method, what);
+                found.unknown(GraphExport.simpleClassName(n), bci(n));
                 return;
             }
             for (LocationIdentity killedLocation : killed) {
-                if (killedLocation.isInit()) {
-                    f.allocates.add(method);
-                } else if (location(killedLocation) instanceof String written) {
-                    add(written.startsWith("vm:") ? f.vmWrites : f.writes, method, written);
-                }
+                found.kills(killedLocation);
             }
         }
         if (n instanceof MemoryAccess access) {
             LocationIdentity read = access.getLocationIdentity();
             if (read.isAny()) {
-                add(f.unknownReads, method, what);
-            } else if (!read.isInit() && location(read) instanceof String location && !location.startsWith("vm:")) {
-                add(f.reads, method, location);
+                found.unknownRead(GraphExport.simpleClassName(n), bci(n));
+            } else {
+                found.reads(read);
             }
         }
     }
 
     /**
-     * What a node that synchronizes does, by the Java memory model. After an acquire, this thread
-     * may see what other threads wrote before their release; after a release, other threads may
-     * see what this one wrote before it.
+     * What a synchronizing node does under the Java memory model. After an acquire, this thread may
+     * see what other threads wrote before their release; after a release, other threads may see what
+     * this thread wrote before it.
      */
     private record Synchronization(boolean acquires, boolean releases) {
         static final Synchronization ACQUIRE = new Synchronization(true, false);
@@ -781,11 +1105,9 @@ public final class PointsToExport {
     }
 
     /**
-     * Whether a node synchronizes, and how; null if it doesn't. Entering a lock acquires and
-     * leaving it releases. An ordered load acquires and an ordered store releases: a load can't
-     * show this thread's writes to others, nor a store others' writes to this one. An opaque
-     * access does neither, which counting it as one only overstates. An atomic update, a fence,
-     * and anything else that orders memory do both.
+     * Whether and how a node synchronizes; null if it doesn't. A lock enter acquires and a lock exit
+     * releases. An ordered load acquires and an ordered store releases. An opaque access does neither
+     * (counting it is merely conservative). Atomic updates, fences and other ordering nodes do both.
      */
     private static Synchronization synchronization(Node n) {
         if (n instanceof MonitorEnter) {
@@ -810,27 +1132,26 @@ public final class PointsToExport {
     }
 
     /**
-     * A method as the export names it, and so as the tool's answers do: its class, its name and its
-     * descriptor, with a hidden class named by its content rather than by its address. Hidden
-     * classes are named by the last export.
+     * A method's name in the facts and in kills.txt: class, name and descriptor. Hidden classes
+     * are named by content instead of address, as of the last export.
      */
     public static String methodKey(ResolvedJavaMethod method) {
         return GraphExport.methodKey(method);
     }
 
-    /** A field as the export names it, a hidden class by its content: see {@link #methodKey}. */
+    /** A field's name in the facts; hidden classes as in {@link #methodKey}. */
     public static String fieldName(ResolvedJavaField field) {
         return GraphExport.fieldName(field);
     }
 
-    /** Where a node is, as the exported facts and the decisions about them name it: method:bci, then each caller. */
+    /** A node's position as the facts and decisions name it: {@code method:bci}, then each caller outward. */
     public static String position(BytecodePosition position) {
         return GraphExport.PointsTo.site(position);
     }
 
     /**
-     * A location as the facts name it: a field, an array kind, or vm: and the name of one of the
-     * VM's own, such as vm:TLAB.top. Null for one that never changes.
+     * A location's name in the facts: a field, an array kind, or {@code vm:} plus the name of a VM
+     * location (e.g. {@code vm:TLAB.top}). Null for an immutable location.
      */
     private static String location(LocationIdentity location) {
         if (location.isImmutable()) {
@@ -856,10 +1177,9 @@ public final class PointsToExport {
     }
 
     /**
-     * A field or array access, where it is, and the objects its receiver may point
-     * to, null when the analysis can't say: {"kind": "read", "field": "Examples$Counter.value",
-     * "receivers": ["Examples$Counter@Examples.main([Ljava/lang/String;)V:9"],
-     * "at": "Examples.length(LExamples$Link;)I:5"}.
+     * Records a field or array access with its position and the objects its receiver may point to
+     * (null if unknown), e.g. {"kind": "read", "field": "Examples$Counter.value", "receivers":
+     * ["Examples$Counter@Examples.main([Ljava/lang/String;)V:9"], "at": "Examples.length(LExamples$Link;)I:5"}.
      */
     private static void addAccess(TreeMap<String, TreeSet<String>> accesses, String method, String kind, String field, List<String> receivers, Node node) {
         Map<String, Object> access = new LinkedHashMap<>();
@@ -870,10 +1190,7 @@ public final class PointsToExport {
         add(accesses, method, GraphExport.toJson(access, 2));
     }
 
-    /**
-     * Text that is written to a file piece by piece, because a large export is longer than a
-     * String can be.
-     */
+    /** Text written to a file in pieces, because a large export doesn't fit in one String. */
     private interface Content {
         void writeTo(Writer out) throws IOException;
     }

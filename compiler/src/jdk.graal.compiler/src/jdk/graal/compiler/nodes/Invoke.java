@@ -43,13 +43,12 @@ public interface Invoke extends StateSplit, Lowerable, SingleMemoryKill, Deoptim
     String CYCLES_UNKNOWN_RATIONALE = "Cannot estimate the runtime cost of a call; it's a blackhole.";
     String SIZE_UNKNOWN_RATIONALE = "Can only dynamically decide how much code is generated based on the type of a call (special, static, virtual, interface).";
 
-    /** What an invoke kills unless narrowed: all of memory. */
+    /** The default kill set of an invoke: all of memory. */
     LocationIdentity[] KILLS_ANY = {LocationIdentity.any()};
 
     /**
-     * A canonical kill set: {@link #KILLS_ANY} when the locations include
-     * {@link LocationIdentity#any()}, otherwise the locations without duplicates and without
-     * {@link MemoryKill#NO_LOCATION}.
+     * Normalizes a kill set: {@link #KILLS_ANY} if it contains {@link LocationIdentity#any()},
+     * otherwise the locations without duplicates and without {@link MemoryKill#NO_LOCATION}.
      */
     static LocationIdentity[] killSet(LocationIdentity... locations) {
         List<LocationIdentity> set = new ArrayList<>(locations.length);
@@ -65,7 +64,8 @@ public interface Invoke extends StateSplit, Lowerable, SingleMemoryKill, Deoptim
     }
 
     /**
-     * The one location a kill set kills: {@link MemoryKill#NO_LOCATION} for none,
+     * A kill set as one location, for code that only understands {@link SingleMemoryKill}:
+     * {@link MemoryKill#NO_LOCATION} for an empty set, the location for one, and
      * {@link LocationIdentity#any()} for two or more.
      */
     static LocationIdentity singleKill(LocationIdentity[] locations) {
@@ -73,8 +73,9 @@ public interface Invoke extends StateSplit, Lowerable, SingleMemoryKill, Deoptim
     }
 
     /**
-     * Narrows the locations this invoke kills to those its callees may write. With none it is no
-     * memory kill at all, with one a single kill, and with two or more a multi kill.
+     * Restricts the memory this invoke may write. The locations must cover everything any possible
+     * callee may write. An empty set makes the invoke kill nothing, one location makes it a single
+     * kill, two or more a multi kill.
      */
     void setKilledLocationIdentities(LocationIdentity... locations);
 

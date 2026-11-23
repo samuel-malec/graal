@@ -33,6 +33,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.BiConsumer;
 
 import com.oracle.graal.pointsto.AbstractAnalysisEngine;
 import com.oracle.graal.pointsto.ObjectScanner.EmbeddedRootScan;
@@ -243,6 +244,10 @@ public class MethodTypeFlowBuilder {
 
         try (DebugContext.Scope s = graph.getDebug().scope("MethodTypeFlowBuilder", graph)) {
             optimizeGraphBeforeAnalysis(bb, method, graph);
+            BiConsumer<PointsToAnalysisMethod, StructuredGraph> listener = bb.getGraphListener();
+            if (listener != null) {
+                listener.accept(method, graph);
+            }
 
             if (!bb.getUniverse().hostVM().validateGraph(bb, graph)) {
                 graph = null;

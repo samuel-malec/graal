@@ -46,16 +46,20 @@ import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.typestate.TypeState;
 
 /**
- * What a flow of the points-to analysis may hold, in a form that survives saturation. A flow that did
- * not saturate holds the objects of its state, restricted to its declared type. A flow that did has
- * stopped saying: what it held is rebuilt from the flows that feed it (the analysis must have recorded
- * them, {@code -H:+TrackInputFlows}), where they are exact; from what was stored into the field or the
- * arrays it loads from; and where nothing is known, as any object of its type.
+ * Says what a points-to flow may hold, even after it saturated. An unsaturated flow holds the
+ * objects of its state, filtered by its declared type. For a saturated flow the analysis stopped
+ * tracking contents, so they are rebuilt from the flows that feed it (recorded with
+ * {@code -H:+TrackInputFlows}): exact inputs as they are, loads by what was stored into the field
+ * or arrays they read, and anything unknown as any object of the declared type.
  */
 final class FlowReader {
 
-    /** What flows may hold: the objects the analysis knows, and any object of a type for a flow that saturated. */
+    /**
+     * What some flows may hold: the analysis' states, "any object of a type" (for saturated flows),
+     * the places saturated loads read from (resolved once all stores are known), and single objects.
+     */
     record Held(List<TypeState> states, List<AnalysisType> any, List<Source> stored, List<AnalysisObject> objects) {
+
         static final Held NOTHING = new Held(List.of(), List.of(), List.of(), List.of());
 
         Held(List<TypeState> states, List<AnalysisType> any) {
@@ -70,7 +74,7 @@ final class FlowReader {
             return states.isEmpty() && any.isEmpty() && stored.isEmpty() && objects.isEmpty();
         }
 
-        /** The objects the states and the list name. */
+        /** The objects named by the states and the list. */
         Iterable<AnalysisObject> objectsIn(PointsToAnalysis bb) {
             List<AnalysisObject> all = new ArrayList<>(objects);
             for (TypeState state : states) {
@@ -100,16 +104,29 @@ final class FlowReader {
     }
 
     /**
-     * What a load that saturated reads: what was stored into a place, which is a field, the
-     * arrays, or what feeds a flow, restricted to the objects that have all of the types the
-     * loads on the way give.
+     * What a saturated load reads: what was stored into a place (a field, all arrays, or a flow's
+     * inputs), filtered to objects that have every type the loads along the way require.
      */
     record Source(Object key, List<AnalysisType> filters) {
     }
 
+    /** Cache key for the meet of two type lists. */
     private record Pair(List<AnalysisType> a, List<AnalysisType> b) {
     }
 
+    /**
+     * The key for the place "all arrays" in a {@link Source}. The analysis gives all arrays one element
+     * flow, so a saturated array load may read what was stored into any array.
+     */
+    static final Object ARRAYS = new Object();
+
+    /** No type filter: the declared type says nothing, or a place is read as it is. */
+    static final List<AnalysisType> NO_TYPES = List.of();
+
+    /** Cache marker for "no object has all these types"; a distinct list that no meet produces. */
+    private static final List<AnalysisType> NOBODY = Collections.unmodifiableList(new ArrayList<>());
+
+    // Shared with the thread-escape run this reader serves.
     private final ThreadEscape escape;
     private final PointsToAnalysis bb;
     private final Set<String> assumptions;
@@ -119,26 +136,17 @@ final class FlowReader {
     private final Set<AnalysisObject> shared;
     SharingExplanation why;
 
-    /**
-     * What a saturated flow that loads from a field, or from an array, holds: not any object of its
-     * declared type, but any object stored into that field, or into any array, since the arrays
-     * have one elements flow. Known when every site is.
-     */
-    static final Object ARRAYS = new Object();
-
-    /** Stands for "no object has them all" in the cache of meets; a list of its own, which no meet is. */
-    private static final List<AnalysisType> NOBODY = Collections.unmodifiableList(new ArrayList<>());
-
+    // Caches for type questions that are asked many times.
+    /** Meets of pairs of type lists; its size appears in the progress output. */
     final Map<Pair, List<AnalysisType>> meets = new HashMap<>();
-    static final List<AnalysisType> NO_TYPES = List.of();
     private final Map<Long, Boolean> assignable = new HashMap<>();
     private final Map<AnalysisType, Set<AnalysisType>> subtypes = new HashMap<>();
 
-    /** How many traces of a rebuilt flow that holds any object of a type were printed, when explaining: at most 400. */
-    private int anyPrinted;
-
     /** What each saturated flow rebuilt so far holds. */
     private final Map<TypeFlow<?>, Held> rebuilt = new IdentityHashMap<>();
+
+    /** How many traces of "any object of a type" were printed while explaining (at most 400). */
+    private int anyPrinted;
 
     FlowReader(ThreadEscape escape) {
         this.escape = escape;
@@ -150,11 +158,12 @@ final class FlowReader {
         this.shared = escape.shared;
     }
 
+    /** Connects the explanation, created after the reader. */
     void connect(SharingExplanation why) {
         this.why = why;
     }
 
-    /** The same place, for a load that gives these types too; null if no object has them all. */
+    /** The same place, for a load that also requires these types; null if no object can have them all. */
     Source narrowed(Source source, List<AnalysisType> others) {
         if (others.isEmpty() || others == source.filters()) {
             return source;
@@ -172,7 +181,7 @@ final class FlowReader {
         return both.equals(source.filters()) ? source : new Source(source.key(), both);
     }
 
-    /** The types an object must have to have all of both; null if no object can. Redundant types are left out. */
+    /** The types an object needs to have all of both lists, without redundant ones; null if impossible. */
     private List<AnalysisType> meet(List<AnalysisType> a, List<AnalysisType> b) {
         if (a.isEmpty() || a.equals(b)) {
             return b;
@@ -191,6 +200,8 @@ final class FlowReader {
                 all.add(type);
             }
         }
+        // A type is redundant if another type in the list is its subtype. Of two types that are each
+        // other's subtype, the first is kept.
         List<AnalysisType> kept = new ArrayList<>();
         for (AnalysisType type : all) {
             boolean redundant = false;
@@ -215,6 +226,7 @@ final class FlowReader {
         return List.copyOf(kept);
     }
 
+    /** Whether no object can have both types: two unrelated classes, or an array and an interface arrays don't implement. */
     static boolean noObjectHasBoth(AnalysisType x, AnalysisType y) {
         if (x.isAssignableFrom(y) || y.isAssignableFrom(x)) {
             return false;
@@ -222,16 +234,16 @@ final class FlowReader {
         if (!x.isInterface() && !y.isInterface()) {
             return true;
         }
-        // An array has the types of arrays, and no other interface.
+        // An array has only the array interfaces.
         AnalysisType other = x.isInterface() ? x : y;
         AnalysisType notInterface = x.isInterface() ? y : x;
         return notInterface.isArray() && !mayBeArray(other);
     }
 
     /**
-     * The flow an access observes. When that flow saturated, the analysis has the access observe the
-     * flow of the declared type instead; the one it observed first, if there was only one, says
-     * more (the inputs of the flows must have been recorded).
+     * The flow an access observes. When it saturated, the analysis switches the access to the
+     * declared type's flow; the original flow, if there was only one, says more (needs recorded
+     * inputs).
      */
     TypeFlow<?> observedBy(TypeFlow<?> access, TypeFlow<?> observed) {
         if (observed == null || !observed.isAllInstantiated() || !bb.trackTypeFlowInputs()) {
@@ -249,12 +261,13 @@ final class FlowReader {
         return first != null ? first : observed;
     }
 
-    /** The types that restrict what a flow holds: its declared one, unless that says nothing. */
+    /** The type filter of a flow: its declared type, unless that says nothing. */
     private List<AnalysisType> filterOf(TypeFlow<?> flow) {
         AnalysisType declared = flow.getDeclaredType();
         return declared == null || declared.isPrimitive() || declared.isJavaLangObject() ? NO_TYPES : List.of(declared);
     }
 
+    /** Whether every object of the type has the filter's type (cached {@code isAssignableFrom}). */
     boolean assignableTo(AnalysisType filter, AnalysisType type) {
         long key = filter.getId() * 0x9E3779B97F4A7C15L + type.getId();
         Boolean known = assignable.get(key);
@@ -265,6 +278,7 @@ final class FlowReader {
         return known;
     }
 
+    /** Whether an object of the type has all the filter types. */
     boolean matches(List<AnalysisType> filters, AnalysisType type) {
         for (AnalysisType filter : filters) {
             if (!assignableTo(filter, type)) {
@@ -274,7 +288,7 @@ final class FlowReader {
         return true;
     }
 
-    /** The type and all its subtypes, which the hierarchy lists; arrays are not among them. */
+    /** The type and all its subtypes from the hierarchy; arrays are not included. */
     Set<AnalysisType> subtypesOf(AnalysisType type) {
         Set<AnalysisType> found = subtypes.get(type);
         if (found == null) {
@@ -285,7 +299,7 @@ final class FlowReader {
         return found;
     }
 
-    /** What a held holds of the types: the objects that have them, the types it narrows to, and where else it reads from, narrowed. */
+    /** What a value holds of the given types: matching objects, the types it narrows to, and where else it reads from. */
     private Held filtered(Held held, List<AnalysisType> filters) {
         if (filters.isEmpty() || held.isNothing()) {
             return held;
@@ -318,10 +332,7 @@ final class FlowReader {
         return false;
     }
 
-    /**
-     * Adds the types of saturated flows that can be of the types asked for: the types themselves,
-     * or the types asked for that they stand for.
-     */
+    /** Adds the types of saturated flows that may hold objects of the requested types. */
     void narrowAny(Collection<AnalysisType> into, Iterable<AnalysisType> any, List<AnalysisType> filters) {
         for (AnalysisType type : any) {
             if (matches(filters, type)) {
@@ -344,7 +355,7 @@ final class FlowReader {
         }
     }
 
-    /** Whether the objects may include an array: one that is, or a flow that saturated at a type an array may have. */
+    /** Whether the objects may include an array: an array object, or a flow saturated at a type an array may have. */
     boolean mayBeArray(Held held) {
         if (hasArray(held.objectsIn(bb))) {
             return true;
@@ -362,7 +373,7 @@ final class FlowReader {
         return false;
     }
 
-    /** Whether an array can have the type: an array type, or one of the types all arrays have. */
+    /** Whether an array can have the type: an array type, or one of the interfaces all arrays have. */
     static boolean mayBeArray(AnalysisType type) {
         if (type.isArray() || type.isJavaLangObject()) {
             return true;
@@ -371,14 +382,14 @@ final class FlowReader {
         return name.equals("java.lang.Cloneable") || name.equals("java.io.Serializable");
     }
 
-    /** What a flow may hold: nothing for a flow of primitives or one that is disabled, in code the analysis never reached. */
+    /** What a flow may hold; nothing for a primitive flow or a disabled one (code the analysis never reached). */
     Held held(TypeFlow<?> flow) {
         return held(flow, false);
     }
 
     /**
-     * What a flow may hold. {@code deferred} lets a saturated load say what it loads from the stores
-     * into what it loads from, once they are all known.
+     * What a flow may hold. {@code deferred} lets a saturated load resolve what it loads from the
+     * stores into its source, once all stores are known.
      */
     Held held(TypeFlow<?> flow, boolean deferred) {
         if (flow == null || flow.isPrimitiveFlow()) {
@@ -405,10 +416,9 @@ final class FlowReader {
     }
 
     /**
-     * What a flow that saturated holds, from the flows that feed it: where they are exact, what they
-     * hold; where one loads from a field, what is stored into the field; where it was injected,
-     * any object of its declared type; or where nothing is known about what feeds it. The analysis
-     * recorded the inputs of its flows if {@code -H:+TrackInputFlows} was given.
+     * Rebuilds what a saturated flow holds from the flows that feed it: exact inputs as they are,
+     * field loads by what was stored into the field, injected values as any object of the declared
+     * type, and unknown inputs likewise. Needs {@code -H:+TrackInputFlows}.
      */
     Held rebuild(TypeFlow<?> start) {
         return rebuilt.computeIfAbsent(start, this::rebuildFrom);
@@ -430,7 +440,7 @@ final class FlowReader {
             }
             if (!flow.isSaturated()) {
                 if (entryPoints && bb.getRootParameterFlows().contains(flow)) {
-                    // What the callers outside the analysed code pass is not what the code stores: only the calls it makes.
+                    // What callers outside the analyzed code pass is not stored by the code; only its own calls count.
                     for (TypeFlow<?> input : flow.getInputs()) {
                         if (!input.isAllInstantiated()) {
                             queue.add(input);
@@ -440,30 +450,14 @@ final class FlowReader {
                 }
                 TypeState state = flow.getOutputState(bb);
                 if (state != null && !state.isPrimitive() && !state.isEmpty()) {
-                    List<AnalysisType> restriction = filterOf(flow);
-                    if (restriction.isEmpty()) {
-                        states.add(state);
-                    } else {
-                        for (AnalysisObject object : state.objects(bb)) {
-                            if (matches(restriction, object.type())) {
-                                kept.add(object);
-                            }
-                        }
-                    }
+                    keepExact(flow, state, states, kept);
                     if (explain != null) {
-                        for (AnalysisObject object : state.objects(bb)) {
-                            if (object.isContextInsensitiveObject() && explain.matcher(GraphExport.PointsTo.objectName(object)).find() && !shared.contains(object)) {
-                                StringBuilder trace = new StringBuilder("THREADESCAPE rebuilding " + why.describeStored(start) + " finds " + GraphExport.PointsTo.objectName(object) + " in");
-                                for (TypeFlow<?> at = flow; at != null; at = parents.get(at)) {
-                                    trace.append("\n    ").append(why.describeStored(at)).append(at.isSaturated() ? " (saturated)" : "").append(" with ").append(at.isSaturated() ? 0 : at.getOutputState(bb).typesCount()).append(" types");
-                                }
-                                PointsToExport.diagnostics().println(trace);
-                            }
-                        }
+                        traceFound(start, flow, state, parents);
                     }
                 }
                 continue;
             }
+            // A saturated flow: what it reads from, or what feeds it.
             AnalysisType declared = flow.getDeclaredType() != null && !flow.getDeclaredType().isPrimitive() ? flow.getDeclaredType() : objectType;
             Collection<TypeFlow<?>> inputs = flow.getInputs();
             if (flow instanceof OffsetLoadTypeFlow.LoadIndexedTypeFlow && bb.analysisPolicy().aliasArrayTypeFlows()) {
@@ -471,17 +465,12 @@ final class FlowReader {
             } else if (flow instanceof LoadFieldTypeFlow load && !load.field().isStatic()) {
                 stored.add(new Source(load.field(), filterOf(flow)));
             } else if (flow instanceof LoadFieldTypeFlow) {
-                // A static field holds what was stored into it, which every thread reaches.
+                // A static field holds what was stored into it, which every thread can reach.
                 continue;
             } else if (flow.isAllInstantiated() || inputs.isEmpty()) {
                 any.add(declared);
                 if (explain != null && anyPrinted++ < 400) {
-                    StringBuilder trace = new StringBuilder("THREADESCAPE rebuilding " + why.describeStored(start) + " has any " + declared.toJavaName() + " from " + why.describeStored(flow) +
-                                    (flow.isAllInstantiated() ? " (all instantiated)" : " (no inputs)"));
-                    for (TypeFlow<?> at = parents.get(flow); at != null && trace.length() < 1500; at = parents.get(at)) {
-                        trace.append("\n    <- ").append(why.describeStored(at)).append(at.isSaturated() ? " (saturated)" : "");
-                    }
-                    PointsToExport.diagnostics().println(trace);
+                    traceAny(start, flow, declared, parents);
                 }
             } else {
                 boolean injected = entryPoints && bb.getRootParameterFlows().contains(flow);
@@ -499,7 +488,45 @@ final class FlowReader {
         return new Held(states, new ArrayList<>(any), new ArrayList<>(stored), kept);
     }
 
-    /** Adds what a flow may hold: nothing for a saturated one, which its caller handles, or a disabled one, in code the analysis never reached. */
+    /** Takes what an exact flow holds: its whole state, or the objects of its declared type. */
+    private void keepExact(TypeFlow<?> flow, TypeState state, List<TypeState> states, List<AnalysisObject> kept) {
+        List<AnalysisType> restriction = filterOf(flow);
+        if (restriction.isEmpty()) {
+            states.add(state);
+        } else {
+            for (AnalysisObject object : state.objects(bb)) {
+                if (matches(restriction, object.type())) {
+                    kept.add(object);
+                }
+            }
+        }
+    }
+
+    /** When explaining: prints how rebuilding reached each matching summary that is not shared yet. */
+    private void traceFound(TypeFlow<?> start, TypeFlow<?> flow, TypeState state, Map<TypeFlow<?>, TypeFlow<?>> parents) {
+        for (AnalysisObject object : state.objects(bb)) {
+            if (object.isContextInsensitiveObject() && explain.matcher(GraphExport.PointsTo.objectName(object)).find() && !shared.contains(object)) {
+                StringBuilder trace = new StringBuilder("THREADESCAPE rebuilding " + why.describeStored(start) + " finds " + GraphExport.PointsTo.objectName(object) + " in");
+                for (TypeFlow<?> at = flow; at != null; at = parents.get(at)) {
+                    trace.append("\n    ").append(why.describeStored(at)).append(at.isSaturated() ? " (saturated)" : "").append(" with ").append(at.isSaturated() ? 0
+                                    : at.getOutputState(bb).typesCount()).append(" types");
+                }
+                PointsToExport.diagnostics().println(trace);
+            }
+        }
+    }
+
+    /** When explaining: prints how rebuilding reached a flow that can only say "any object of its type". */
+    private void traceAny(TypeFlow<?> start, TypeFlow<?> flow, AnalysisType declared, Map<TypeFlow<?>, TypeFlow<?>> parents) {
+        StringBuilder trace = new StringBuilder("THREADESCAPE rebuilding " + why.describeStored(start) + " has any " + declared.toJavaName() + " from " + why.describeStored(flow) +
+                        (flow.isAllInstantiated() ? " (all instantiated)" : " (no inputs)"));
+        for (TypeFlow<?> at = parents.get(flow); at != null && trace.length() < 1500; at = parents.get(at)) {
+            trace.append("\n    <- ").append(why.describeStored(at)).append(at.isSaturated() ? " (saturated)" : "");
+        }
+        PointsToExport.diagnostics().println(trace);
+    }
+
+    /** Adds what a flow may hold; nothing for a saturated one (the caller handles it) or a disabled one. */
     void collect(TypeFlow<?> flow, Set<AnalysisObject> into) {
         TypeState state = flow.isSaturated() ? null : flow.getOutputState(bb);
         if (state != null && !state.isPrimitive()) {

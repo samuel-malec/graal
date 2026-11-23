@@ -25,6 +25,7 @@
 package com.oracle.svm.hosted.sideeffects;
 
 import java.io.IOException;
+import java.io.PrintStream;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -57,127 +58,153 @@ import jdk.graal.compiler.phases.tiers.Suites;
 import jdk.graal.compiler.phases.util.Providers;
 
 /**
- * Applies a side-effect analysis to the image's compilation, in one native-image build. After the
- * points-to analysis, the feature exports its results ({@link PointsToExport}) and runs the
- * explicit-effects tool on them (effects.kills), which says what each method, with everything it
- * calls, may write ({@link KillSets}); with {@code -H:SideEffectAnalysisKillSets=build} the
- * builder works that out itself from the same facts, without the export. Right after Native Image
- * inlines, every call in the program's methods, the inlined ones included, kills only those
- * locations instead of all of memory, and Graal's own phases do the rest
- * ({@link ApplySideEffectAnalysisPhase}). The tool can
- * also give each access to a field the location of its partition of the objects
- * ({@link FieldPartitions}). A phase at the end of the low tier counts the field stores, field
- * loads and calls left in the program's methods ({@link CompiledCodeCounts}), and timings.txt
- * records what each step of the analysis cost in the build ({@link StepTimes}).
+ * Narrows what calls may write, using the closed-world points-to analysis, so that Graal's own
+ * memory optimizations (read elimination, floating reads, loop-invariant motion) work across calls
+ * they can't see into. Enabled with {@code -H:+SideEffectAnalysis}; options are in {@link Options}.
  * <p>
- * Enabled with {@code -H:+SideEffectAnalysis}; the other options are in {@link Options}. With
- * {@code -H:Dump=:1}, the graph is dumped right after the analysis is applied, titled "After
- * applying the side-effect analysis".
+ * One build goes like this:
+ * <ol>
+ * <li>After the points-to analysis, {@link PointsToExport} collects each reachable method's facts:
+ * what it reads and writes, allocates, calls and synchronizes on.</li>
+ * <li>From the facts, each method gets a kill set: what a call to it may write, including through
+ * its callees, or {@code any} if that can't be bounded. This is computed either in the builder
+ * ({@code -H:SideEffectAnalysisKillSets=build}, {@code KillSetComputation}) or by the Python tool
+ * {@code effects.kills} on a JSON export. See {@link KillSets}.</li>
+ * <li>Right after Native Image's inliners, {@link ApplySideEffectAnalysisPhase} gives every call
+ * in the program's methods (inlined ones included) the union of its possible callees' kill sets.
+ * Graal's existing phases then do the optimizing.</li>
+ * <li>Optionally, field accesses get partitioned locations ({@link FieldPartitions}), locks on
+ * thread-local objects are removed ({@link LockElision}), and overwritten stores are removed
+ * ({@link EliminateOverwrittenStoresPhase}).</li>
+ * <li>At the end of the low tier, {@link CompiledCodeCounts} counts the loads, stores and calls
+ * left in the program's methods; {@code timings.txt} records what each step cost
+ * ({@link StepTimes}).</li>
+ * </ol>
+ * With {@code -H:Dump=:1}, the graph is dumped right after the calls are narrowed ("After applying
+ * the side-effect analysis").
  * <p>
- * Every narrowed call also kills what a safepoint in its callees may change, as Native Image's
- * own safepoints do: the thread's allocation buffer, which a collection resets. Native Image
- * lowers an allocation after the memory graph is built, so its read of the buffer would otherwise
- * come from before the call. No call kills init memory: a callee initializes, publishes and fences
- * what it allocates before it returns ({@code PublishWritesNode}), and Graal takes a kill of init
- * for an initializing write that a barrier must follow ({@code InitMemoryVerificationPhase}).
+ * Every narrowed call also kills the VM state that a safepoint in a callee may change, as Native
+ * Image's own safepoints do: notably the allocation buffer, which a GC resets. Allocations are
+ * lowered after the memory graph is built, so without this kill an allocation after the call could
+ * use a buffer pointer read before it. No call kills init memory: a callee initializes, publishes
+ * and fences what it allocates before returning ({@code PublishWritesNode}), and
+ * {@code InitMemoryVerificationPhase} would treat a kill of init memory as an initializing write
+ * that needs a barrier.
  */
 @AutomaticallyRegisteredFeature
 public final class SideEffectAnalysisFeature implements InternalFeature {
 
     public static final class Options {
-        @Option(help = "Apply a side-effect analysis (the explicit-effects tool) to the compilation: narrow what each call kills, and optionally partition field locations.", //
+        @Option(help = "Narrow the memory each call may write, using the points-to analysis' view of its callees, so Graal's memory optimizations can work across calls. Optionally partition field locations by object.", //
                         stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<Boolean> SideEffectAnalysis = new HostedOptionKey<>(false);
 
-        @Option(help = "The explicit-effects checkout whose tool computes the side effects; it runs with uv.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Path to the explicit-effects checkout, whose Python tool computes kill sets and lock decisions when they are not computed in the builder. Run with uv.", //
+                        stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<String> SideEffectAnalysisTool = new HostedOptionKey<>(".");
 
-        @Option(help = "The uv executable that runs the side-effect tool, as the builder's environment may not find it.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "The uv executable used to run the Python tool, in case the builder's environment doesn't find it.", //
+                        stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<String> SideEffectAnalysisUv = new HostedOptionKey<>("uv");
 
-        @Option(help = "Directory for the exported points-to results, the tool's answers, the counts of what Graal leaves and what each step of the analysis cost.", //
+        @Option(help = "Output directory: the export, kill sets, per-method counts of what Graal leaves, and the time each step took.", //
                         stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<String> SideEffectAnalysisOutput = new HostedOptionKey<>("side-effect-analysis");
 
-        @Option(help = "Comma-separated class-name prefixes of the program whose calls are narrowed and whose accesses are counted, and that the export describes. " +
-                        "Empty: every class outside the platform's packages; *: every class.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Comma-separated class-name prefixes of the program: its methods get narrowed calls and are counted. " +
+                        "Empty: every class outside the JDK, Native Image and Graal. *: every class in the image.", //
+                        stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<String> SideEffectAnalysisProgram = new HostedOptionKey<>("");
 
-        @Option(help = "Narrow what each call kills. Off, the feature only counts what Graal leaves, as a baseline.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Narrow the calls. Off: nothing is narrowed and the feature only counts what Graal leaves (the baseline).", //
+                        stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<Boolean> SideEffectAnalysisNarrowCalls = new HostedOptionKey<>(true);
 
-        @Option(help = "How finely memory is partitioned: field keeps Graal's locations; object-field also splits each field by the sets of objects points-to analysis tells apart, " +
-                        "which needs -H:AnalysisContextSensitivity=allocsens and -H:+TrackNodeSourcePosition.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "How memory is partitioned. field: Graal's usual per-field locations. object-field: also split a field by groups of objects that no access mixes; " +
+                        "needs -H:AnalysisContextSensitivity=allocsens and -H:+TrackNodeSourcePosition.", //
+                        stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<String> SideEffectAnalysisPartition = new HostedOptionKey<>("field");
 
-        @Option(help = "Also run Graal's OverwrittenStoreEliminationPhase on the program's methods, right after the analysis is applied: " +
-                        "with the partitions, it removes the stores that are overwritten before anything reads them.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Also run OverwrittenStoreEliminationPhase on the program's methods, right after the calls are narrowed. " +
+                        "With partitions it can remove stores that are overwritten before they can be read.", //
+                        stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<Boolean> SideEffectAnalysisEliminateOverwrittenStores = new HostedOptionKey<>(false);
 
-        @Option(help = "Also export the program's graphs, to translate them with the tool afterwards (graal2ct).", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Also export the program's graphs, for the tool's translation to the token form (graal2ct).", //
+                        stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<Boolean> SideEffectAnalysisExportGraphs = new HostedOptionKey<>(false);
 
-        @Option(help = "Comma-separated method prefixes, as the export names methods: narrow the calls of only these methods.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Narrow calls only in methods with these comma-separated name prefixes (as the export names methods). For debugging.", //
+                        stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<String> SideEffectAnalysisOnlyMethods = new HostedOptionKey<>("");
 
-        @Option(help = "Comma-separated method prefixes, as the export names methods: narrow the calls of all methods but these.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Don't narrow calls in methods with these comma-separated name prefixes (as the export names methods). For debugging.", //
+                        stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<String> SideEffectAnalysisSkipMethods = new HostedOptionKey<>("");
 
-        @Option(help = "Have every narrowed call also kill the VM state a safepoint may change. Off is a control that must break images.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Every narrowed call also kills the VM state a safepoint may change (allocation buffer, safepoint counter). Off is unsafe; for testing only.", //
+                        stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<Boolean> SideEffectAnalysisKillVMState = new HostedOptionKey<>(true);
 
-        @Option(help = "Have narrowed calls kill the platform's fields they write. Off is a control that must break images.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Narrowed calls also kill the JDK and VM fields their callees write. Off is unsafe; for testing only: images must break.", //
+                        stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<Boolean> SideEffectAnalysisKillPlatformFields = new HostedOptionKey<>(true);
 
-        @Option(help = "Control: a method, as the export names it, claimed to write nothing, so that a wrong answer shows in the program's output.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Test only, deliberately unsound: claim that this method (as the export names it) writes nothing. The program's output must then go wrong.", //
+                        stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<String> SideEffectAnalysisClaimWritesNothing = new HostedOptionKey<>("");
 
-        @Option(help = "Control: a method in which different references are claimed never to meet, as an unsound points-to analysis would, so that a wrong partition shows in the output.", //
+        @Option(help = "Test only, deliberately unsound: in this method, claim that different references never point to the same object. The program's output must then go wrong.", //
                         stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<String> SideEffectAnalysisClaimNoAliasing = new HostedOptionKey<>("");
 
-        @Option(help = "Work out which objects other threads can reach, and record the locks and volatile accesses to judge them by. " +
-                        "Off (-H:-SideEffectAnalysisThreadEscape) the facts say only that a method acquires or releases, with no list of shared objects, " +
-                        "so every acquire and release counts as ordering this thread with another, and no lock or volatile access can be removed or made ordinary: " +
-                        "the side-effect analysis then does nothing that depends on a model of concurrency. " +
-                        "Not with -H:+SideEffectAnalysisElideLocks, the assumptions or the lock claims.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Compute which objects other threads can reach, and record the objects of locks and volatile accesses. " +
+                        "Off: every acquire and release counts as synchronizing with another thread, and no lock or volatile access can be removed or made plain. " +
+                        "Required by -H:+SideEffectAnalysisElideLocks, the assumptions and the lock claims.", //
+                        stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<Boolean> SideEffectAnalysisThreadEscape = new HostedOptionKey<>(true);
 
-        @Option(help = "Comma-separated assumptions thread escape makes on top of what the points-to analysis shows: " +
-                        "thread-confined (the object a thread parks on and its thread locals are read only by it), " +
-                        "vm-fields (the virtual machine's own state is read only by it), " +
-                        "vm-code (the virtual machine's code stores references only where it reads them), " +
+        @Option(help = "Comma-separated assumptions thread escape may make beyond what the points-to analysis shows: " +
+                        "thread-confined (a thread's park blocker and thread locals are read only by that thread), " +
+                        "vm-fields (the VM's own fields are read only by the VM), " +
+                        "vm-code (VM code stores references only where VM code reads them), " +
                         "handler-references (the reference handler thread never reads a referent), " +
-                        "entry-points (the callers of the roots outside the analysed code pass only shared objects and keep nothing the roots return). " +
-                        "Empty: none. The analysis must track the inputs of its flows (-H:+TrackInputFlows) for the last to matter.", stability = OptionStability.EXPERIMENTAL)//
+                        "entry-points (the VM's calls into the analysis roots pass only shared objects and publish nothing the roots return). " +
+                        "Empty: none. entry-points needs -H:+TrackInputFlows to have an effect.", //
+                        stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<String> SideEffectAnalysisAssumptions = new HostedOptionKey<>("");
 
-        @Option(help = "Remove the monitor enters and exits on objects that only one thread reaches and nothing waits or notifies on, as the tool decides (effects.elide). " +
-                        "Needs -H:+TrackNodeSourcePosition, and thread escape assumptions to find any. An image that can deoptimize keeps its monitors.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Remove locks on objects only one thread can reach and that nothing waits on or notifies, as the tool decides (effects.elide), and make volatile accesses on such objects plain. " +
+                        "Needs -H:+TrackNodeSourcePosition and thread-escape assumptions to find any. Images that can deoptimize keep their locks.", //
+                        stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<Boolean> SideEffectAnalysisElideLocks = new HostedOptionKey<>(false);
 
-        @Option(help = "Control: a method, as the export names it, whose monitors and volatile accesses are claimed to be on objects only one thread reaches, " +
-                        "so that they are removed or made ordinary whatever the tool says; a program that shares them must then go wrong.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Test only, deliberately unsound: claim that every lock and volatile access in this method (as the export names it) is on a thread-local object, " +
+                        "so they are removed or made plain. A program that shares them must then go wrong.", //
+                        stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<String> SideEffectAnalysisClaimLocksLocal = new HostedOptionKey<>("");
 
-        @Option(help = "Control: remove the monitors the tool lists in an image that can deoptimize as well, which the image otherwise keeps; " +
-                        "code compiled while the program runs and deoptimized inside a locked region must then leave the thread holding the lock.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Test only, deliberately unsound: remove listed locks even in an image that can deoptimize. " +
+                        "Code deoptimized inside a removed lock must then leave the thread holding the lock.", //
+                        stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<Boolean> SideEffectAnalysisClaimNoDeoptimization = new HostedOptionKey<>(false);
 
-        @Option(help = "Control, never sound: comma-separated effects whose kill is left out of the kill sets " +
-                        "(identity-hash, class-initialization, synchronization, unresolved-calls, calls-without-facts, other-effects; all: every one), " +
-                        "to measure the most that precise kill sets could give Graal. The image may be wrong; its output must still be compared with the JVM's.", //
+        @Option(help = "Measurement only, never sound: treat these kinds of effect as writing nothing when computing kill sets " +
+                        "(identity-hash, class-initialization, synchronization, unresolved-calls, calls-without-facts, other-effects; all: every one). " +
+                        "Gives an upper bound on what more precise kill sets could gain. The image may be wrong; always compare its output with the JVM's.", //
                         stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<String> SideEffectAnalysisIgnoreEffects = new HostedOptionKey<>("");
 
-        @Option(help = "How the counts name this build. Empty: from the other options (graal, fields, objects or graal-dse).", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Name of this configuration in the counts. Empty: derived from the other options (graal, fields, objects or graal-dse).", //
+                        stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<String> SideEffectAnalysisLabel = new HostedOptionKey<>("");
 
-        @Option(help = "Where the kill sets are worked out: tool runs the explicit-effects tool (effects.kills) on the export; " +
-                        "build works them out in the image builder from the same facts, as the tool does, and writes no export unless lock elision or the graphs need it; " +
-                        "both does both and stops the build if they differ. build and both partition by field and leave no effect out. " +
-                        "none is an upper bound for a measurement and never sound: every call kills only the VM's state, no field and no array, " +
-                        "so no facts are exported and no kill sets worked out; the image may be wrong and must not be run, only its counts are read.", stability = OptionStability.EXPERIMENTAL)//
+        @Option(help = "Where the kill sets are computed. tool: the Python tool (effects.kills) on the JSON export. " +
+                        "build: in the image builder (KillSetComputation), with no export unless lock elision or the graphs need one; without thread escape it reuses the graphs the analysis built, so no graph is decoded again. " +
+                        "both: both, and the build fails if they differ. build and both support only per-field partitions and no ignored effects. " +
+                        "none: an upper bound for a measurement, never sound: every call kills only the VM's state, no field and no array, " +
+                        "so no facts are exported and no kill sets worked out; the image may be wrong and must not be run, only its counts are read.", //
+                        stability = OptionStability.EXPERIMENTAL)//
         public static final HostedOptionKey<String> SideEffectAnalysisKillSets = new HostedOptionKey<>("tool");
     }
 
@@ -187,9 +214,8 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
     private final String partition = Options.SideEffectAnalysisPartition.getValue();
     private final boolean overwrittenStores = Options.SideEffectAnalysisEliminateOverwrittenStores.getValue();
     /**
-     * Whether the export holds the program's graphs, which the translation (graal2ct) needs; the
-     * kill sets and partitions need only the facts, so writing and reading the graphs is cost they
-     * don't need.
+     * Whether the export includes the program's graphs. Only the token-form translation (graal2ct)
+     * needs them; kill sets and partitions need only the facts, so writing graphs is wasted otherwise.
      */
     private final boolean graphs = Options.SideEffectAnalysisExportGraphs.getValue();
     private final boolean elideLocks = Options.SideEffectAnalysisElideLocks.getValue();
@@ -206,13 +232,22 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
     private final FieldPartitions partitions = new FieldPartitions(Options.SideEffectAnalysisClaimNoAliasing.getValue());
     private final LockElision lockElision = new LockElision(Options.SideEffectAnalysisClaimLocksLocal.getValue(), Options.SideEffectAnalysisClaimNoDeoptimization.getValue());
     private final CompiledCodeCounts counts = new CompiledCodeCounts(program);
+    /** Size of export.json for timings.txt; 0 if none was written. */
     private long exportBytes;
-    /** For how many methods the build's kill sets were found equal to the tool's; -1 if not compared. */
+    /** Number of methods whose builder and tool kill sets were compared and found equal; -1 if not compared. */
     private int killSetsCompared = -1;
 
     @Override
     public boolean isInConfiguration(IsInConfigurationAccess access) {
         return Options.SideEffectAnalysis.getValue();
+    }
+
+    @Override
+    public void beforeAnalysis(BeforeAnalysisAccess access) {
+        // Thread escape needs each node's objects, which only a graph decoded after the analysis gives.
+        if (narrow && !killSetsBy.equals("tool") && !threadEscape && ((FeatureImpl.BeforeAnalysisAccessImpl) access).getBigBang() instanceof PointsToAnalysis bb) {
+            PointsToExport.recordDuringAnalysis(bb);
+        }
     }
 
     @Override
@@ -251,40 +286,50 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
     }
 
     /**
-     * Exports what the points-to analysis found, and adds what its steps cost to the timings. When
-     * the build works out the kill sets, returns them as the tool writes them, and writes the export
-     * only for what still reads it: the tool when the two are compared, lock elision, the graphs.
-     * Null when the tool works them out.
+     * Collects the facts and records what each step cost. When the builder computes the kill sets,
+     * returns them as kills.txt lines and writes the JSON export only if something still reads it (the
+     * tool, for {@code both}; lock elision; the graphs). Returns null when the tool computes them.
      */
     private List<String> export(FeatureImpl.AfterAnalysisAccessImpl access, Path export) throws IOException {
         long start = System.nanoTime();
         String assumptions = Options.SideEffectAnalysisAssumptions.getValue();
-        if (!threadEscape && (elideLocks || !assumptions.isEmpty() || !Options.SideEffectAnalysisClaimLocksLocal.getValue().isEmpty())) {
-            throw UserError.abort("-H:-SideEffectAnalysisThreadEscape leaves out what -H:+SideEffectAnalysisElideLocks, -H:SideEffectAnalysisAssumptions and -H:SideEffectAnalysisClaimLocksLocal need");
-        }
-        if (!List.of("tool", "build", "both").contains(killSetsBy)) {
-            throw UserError.abort("-H:SideEffectAnalysisKillSets is tool, build, both or none (none only with narrowed calls, and then no export is made), not %s", killSetsBy);
-        }
         boolean inBuild = narrow && !killSetsBy.equals("tool");
-        if (inBuild && (!partition.equals("field") || !ignoredEffects.isEmpty())) {
-            throw UserError.abort("-H:SideEffectAnalysisKillSets=%s partitions by field and leaves no effect out: -H:SideEffectAnalysisPartition and -H:SideEffectAnalysisIgnoreEffects need the tool",
-                            killSetsBy);
-        }
+        checkOptions(assumptions, inBuild);
         boolean written = !(narrow && killSetsBy.equals("build")) || elideLocks || graphs;
         if (!written) {
-            // Not this build's: nothing may read an export an earlier build left here.
+            // Not written by this build: delete it so nothing reads a stale export from an earlier build.
             Files.deleteIfExists(export);
         }
         Set<String> assumed = assumptions.isEmpty() ? PointsToExport.defaultAssumptions() : Set.of(assumptions.split(","));
-        List<String> worked = PointsToExport.export((PointsToAnalysis) access.getBigBang(), access.getUniverse(), written && !graphs ? export.toString() : "",
-                        written && graphs ? export.toString() : "", null, true, program, threadEscape, assumed, inBuild);
+        // The export goes to one of two paths depending on whether it includes graphs; "" writes nothing.
+        String factsOnly = written && !graphs ? export.toString() : "";
+        String withGraphs = written && graphs ? export.toString() : "";
+        PrintStream report = null; // no human-readable summary
+        boolean compiled = true; // the image is compiled next, so a call without targets can never execute
+        List<String> worked = PointsToExport.export((PointsToAnalysis) access.getBigBang(), access.getUniverse(), factsOnly, withGraphs, report, compiled, program, threadEscape, assumed, inBuild);
+        PointsToExport.stopRecording((PointsToAnalysis) access.getBigBang());
         times.time("export", start);
         PointsToExport.STEP_NANOS.forEach((step, stepNanos) -> times.add("export: " + step, stepNanos));
         exportBytes = written ? Files.size(export) : 0;
         return worked;
     }
 
-    /** Runs effects.elide on the export, and reads the monitors and volatile accesses it says can go. */
+    /** Fails the build on options that can't be combined. */
+    private void checkOptions(String assumptions, boolean inBuild) {
+        if (!threadEscape && (elideLocks || !assumptions.isEmpty() || !Options.SideEffectAnalysisClaimLocksLocal.getValue().isEmpty())) {
+            throw UserError.abort(
+                            "-H:-SideEffectAnalysisThreadEscape leaves out what -H:+SideEffectAnalysisElideLocks, -H:SideEffectAnalysisAssumptions and -H:SideEffectAnalysisClaimLocksLocal need");
+        }
+        if (!List.of("tool", "build", "both").contains(killSetsBy)) {
+            throw UserError.abort("-H:SideEffectAnalysisKillSets is tool, build, both or none (none only with narrowed calls, and then no export is made), not %s", killSetsBy);
+        }
+        if (inBuild && (!partition.equals("field") || !ignoredEffects.isEmpty())) {
+            throw UserError.abort("-H:SideEffectAnalysisKillSets=%s partitions by field and leaves no effect out: -H:SideEffectAnalysisPartition and -H:SideEffectAnalysisIgnoreEffects need the tool",
+                            killSetsBy);
+        }
+    }
+
+    /** Runs effects.elide on the export and reads which locks and volatile accesses can go. */
     private void readLockDecisions(Path export) throws IOException, InterruptedException {
         Path locks = out.resolve("locks.txt");
         runTool("effects.elide", export, export.toString(), "-o", locks.toString());
@@ -292,14 +337,14 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
     }
 
     /**
-     * Reads what each method may write, as the build worked it out ({@code worked}) or as
-     * effects.kills says from the export, with objects told apart each access's partition too. With
-     * both, the build stops if the two differ.
+     * Reads each method's kill set: computed by the builder ({@code worked}) or by effects.kills from
+     * the export, which also gives each access its partition for object-field partitions. With
+     * {@code both}, fails the build if the two disagree.
      */
     private void readKillSets(Path export, List<String> worked) throws IOException, InterruptedException {
         Path kills = out.resolve("kills.txt");
         if (killSetsBy.equals("build")) {
-            // What the tool would have written, for what reads kills.txt after the build.
+            // Write the same kills.txt the tool would, for scripts that read it after the build.
             Files.write(kills, worked);
             killSets.read(worked);
             return;
@@ -323,10 +368,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         }
     }
 
-    /**
-     * Stops the build if a method's kill set worked out in the build is not the tool's, and leaves
-     * the build's in kills-build.txt next to the tool's kills.txt.
-     */
+    /** Fails the build if any builder kill set differs from the tool's; the builder's are left in kills-build.txt. */
     private void compare(List<String> byTool, List<String> worked) throws IOException {
         Map<String, String> tool = byMethod(byTool);
         Map<String, String> build = byMethod(worked);
@@ -346,7 +388,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         killSetsCompared = methods.size();
     }
 
-    /** Lines of kills.txt by method: what follows the tab. */
+    /** kills.txt lines by method: the part after the tab. */
     private static Map<String, String> byMethod(List<String> lines) {
         Map<String, String> byMethod = new HashMap<>();
         for (String line : lines) {
@@ -356,10 +398,7 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         return byMethod;
     }
 
-    /**
-     * Runs a module of the tool on the export, {@code python -m module arguments}, as a step of
-     * the analysis.
-     */
+    /** Runs a module of the Python tool on the export ({@code python -m module arguments}) as a timed step. */
     private void runTool(String module, Path export, String... arguments) throws IOException, InterruptedException {
         List<String> command = new ArrayList<>(List.of(Options.SideEffectAnalysisUv.getValue(), "run", "--project", Options.SideEffectAnalysisTool.getValue(), "python", "-m", module));
         command.addAll(List.of(arguments));
@@ -369,10 +408,9 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
     }
 
     /**
-     * Runs a tool of the analysis to its end and stops it, with the processes it started, when the
-     * image generator ends first: the generator's watchdog aborts a build whose step takes ten
-     * minutes (-H:DeadlockWatchdogInterval), and a tool left running would go on using the
-     * machine's memory.
+     * Runs a tool process to completion, and kills it and its children if the image generator exits
+     * first. The generator's watchdog aborts a step that takes ten minutes
+     * (-H:DeadlockWatchdogInterval), and a tool left running would keep using the machine's memory.
      */
     private static void runToEnd(ProcessBuilder builder, String name, Path export) throws IOException, InterruptedException {
         Process tool = builder.inheritIO().start();
@@ -387,11 +425,12 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
             try {
                 Runtime.getRuntime().removeShutdownHook(stop);
             } catch (IllegalStateException e) {
-                // the generator is already ending: the hook runs
+                // the generator is already exiting: the shutdown hook runs
             }
         }
     }
 
+    /** Kills a process and every process it started. */
     private static void stopTree(Process tool) {
         tool.descendants().forEach(ProcessHandle::destroyForcibly);
         tool.destroyForcibly();
@@ -407,20 +446,11 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         if (hosted) {
             if (narrow || elideLocks) {
                 /*
-                 * After Native Image's inliners, where it puts RemoveUnwindPhase, so that the calls
-                 * and stores that inlining brings into a method get the analysis too. Before them
-                 * only canonicalization runs, which no kill set changes.
+                 * Insert after Native Image's inliners (where RemoveUnwindPhase is), so that calls and stores
+                 * inlining brings in are narrowed too. Before the inliners only canonicalization runs, which
+                 * no kill set affects.
                  */
-                List<Phase> phases = new ArrayList<>();
-                if (narrow) {
-                    phases.add(new ApplySideEffectAnalysisPhase(times, killSets, partitions, program, only, skip, counts));
-                    if (overwrittenStores) {
-                        phases.add(new EliminateOverwrittenStoresPhase(times, program, counts));
-                    }
-                }
-                if (elideLocks) {
-                    phases.add(lockElision.newPhase(times, counts));
-                }
+                List<Phase> phases = highTierPhases();
                 ListIterator<BasePhase<? super HighTierContext>> afterInlining = suites.getHighTier().findPhase(RemoveUnwindPhase.class);
                 if (afterInlining != null) {
                     phases.forEach(afterInlining::add);
@@ -436,32 +466,53 @@ public final class SideEffectAnalysisFeature implements InternalFeature {
         }
     }
 
+    /** The phases inserted after the inliners, in order: narrowing calls, overwritten stores, lock elision. */
+    private List<Phase> highTierPhases() {
+        List<Phase> phases = new ArrayList<>();
+        if (narrow) {
+            phases.add(new ApplySideEffectAnalysisPhase(times, killSets, partitions, program, only, skip, counts));
+            if (overwrittenStores) {
+                phases.add(new EliminateOverwrittenStoresPhase(times, program, counts));
+            }
+        }
+        if (elideLocks) {
+            phases.add(lockElision.newPhase(times, counts));
+        }
+        return phases;
+    }
+
     @Override
     public void afterCompilation(AfterCompilationAccess access) {
         try {
             Files.createDirectories(out);
             counts.write(out, label);
-            StringBuilder timings = new StringBuilder("# step\tseconds\truns (the export and the tool once, a phase once per graph, summed over the compiler's threads)\n");
-            times.appendTo(timings);
-            timings.append(String.format("# export.json: %d bytes, %d methods with facts%n", exportBytes, killSets.methodsWithFacts()));
-            if (killSetsCompared >= 0) {
-                timings.append(String.format("# kill sets worked out in the build: the tool's for all %d methods%n", killSetsCompared));
-            }
-            if (!ignoredEffects.isEmpty()) {
-                timings.append(String.format("# the kill of %s is left out of the kill sets: an upper bound, not sound%n", ignoredEffects));
-            }
-            if (narrow && killSetsBy.equals("none")) {
-                timings.append(String.format("# every call kills only the VM's state: an upper bound for counting loads, not sound, the image must not be run%n"));
-            }
-            if (elideLocks) {
-                lockElision.appendTo(timings);
-            }
-            Files.writeString(out.resolve("timings.txt"), timings);
+            Files.writeString(out.resolve("timings.txt"), timings());
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
     }
 
+    /** Contents of timings.txt: each step's cost, then notes on the export, the kill sets and the locks. */
+    private StringBuilder timings() {
+        StringBuilder timings = new StringBuilder("# step\tseconds\truns (the export and the tool once, a phase once per graph, summed over the compiler's threads)\n");
+        times.appendTo(timings);
+        timings.append(String.format("# export.json: %d bytes, %d methods with facts%n", exportBytes, killSets.methodsWithFacts()));
+        if (killSetsCompared >= 0) {
+            timings.append(String.format("# kill sets worked out in the build: the tool's for all %d methods%n", killSetsCompared));
+        }
+        if (!ignoredEffects.isEmpty()) {
+            timings.append(String.format("# the kill of %s is left out of the kill sets: an upper bound, not sound%n", ignoredEffects));
+        }
+        if (narrow && killSetsBy.equals("none")) {
+            timings.append(String.format("# every call kills only the VM's state: an upper bound for counting loads, not sound, the image must not be run%n"));
+        }
+        if (elideLocks) {
+            lockElision.appendTo(timings);
+        }
+        return timings;
+    }
+
+    /** The entries of a comma-separated option; none for an empty one. */
     private static List<String> prefixes(String commaSeparated) {
         return Arrays.stream(commaSeparated.split(",")).filter(prefix -> !prefix.isEmpty()).toList();
     }

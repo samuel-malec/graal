@@ -35,7 +35,7 @@ public class FieldLocationIdentity extends LocationIdentity implements FormatWit
 
     private final ResolvedJavaField inner;
     private final boolean immutable;
-    /** Which part of the field this is, null for all of it: see {@link #getPartition()}. */
+    /** Restricts this location to some of the field's objects, or null: {@link #getPartition()}. */
     private final String partition;
 
     public FieldLocationIdentity(ResolvedJavaField inner) {
@@ -53,12 +53,14 @@ public class FieldLocationIdentity extends LocationIdentity implements FormatWit
     }
 
     /**
-     * The partition of the objects that have the field this location stands for, or null for all
-     * of them. A points-to analysis can split a field's objects into partitions that no access
-     * spans; locations of different partitions are then different memory. Since locations only
-     * overlap when they are equal, a graph must give every access to a field a partition, or
-     * none. A partition is a name, so that the locations an analysis makes apart for the same
-     * partition, such as an access's and a kill's, are equal.
+     * Returns the partition this location is restricted to, or null for the whole field.
+     * <p>
+     * A whole-program analysis can prove that two groups of accesses to a field never touch the
+     * same object. Giving each group its own partition makes the locations unequal, so Graal treats
+     * them as different memory. Locations overlap only when they are equal, so within one graph
+     * either every access to a field has a partition or none does. The partition is a plain name so
+     * that locations created separately for the same partition (an access and a call's kill set)
+     * compare equal.
      */
     public String getPartition() {
         return partition;

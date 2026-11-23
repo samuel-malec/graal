@@ -57,26 +57,23 @@ import jdk.graal.compiler.phases.Phase;
 import jdk.vm.ci.meta.ResolvedJavaField;
 
 /**
- * Removes the field stores that every path overwrites, through the same reference, before
- * anything may read the field, before the method may leave, and before anything that may throw.
- * Such a store is dead in Java: no execution can observe its value, not even a handler up the
- * stack, since nothing between the two stores can throw.
- *
- * From each store, the phase follows the control flow forward, through the nodes it knows to be
+ * Removes a field store when every path overwrites it, through the same reference, before the
+ * field can be read, before the method can return, and before anything can throw. No execution
+ * can observe such a store, not even an exception handler further up the stack.
+ * <p>
+ * From each store the phase walks the control flow forward, passing only nodes it knows are
  * harmless: branches, merges, loop entries and back edges, and accesses to other fields. A path
- * ends well at a store to the same field through the same reference. Any other node ends the
- * search with the store kept: a read of the field, a store to it through another reference, a
- * call, anything with an exception edge, an allocation (which may run out of memory), a return,
- * an unwind, a deoptimization, or any node the phase does not know. A loop that neither reads nor
- * overwrites the field adds nothing, as its exits are followed too.
- *
- * Accesses whose {@link FieldLocationIdentity field locations} carry different partitions, as a
- * points-to analysis can give them, are taken never to touch the same object; without partitions,
- * any two accesses to one field may.
- *
- * A reference is the same at both stores when it is the same value. A value defined in a loop
- * changes from one iteration to the next, so a path through a back edge does not count an
- * overwrite through such a reference: the search keeps the store instead.
+ * succeeds at a store to the same field through the same reference. Anything else keeps the
+ * store: a read of the field, a store to it through another reference, a call, a node with an
+ * exception edge, an allocation (it may throw OutOfMemoryError), a return, an unwind, a
+ * deoptimization, or any unknown node.
+ * <p>
+ * Two accesses whose field locations have different partitions
+ * ({@link FieldLocationIdentity#getPartition()}) are taken to touch different objects. Without
+ * partitions, any two accesses to one field may touch the same object.
+ * <p>
+ * "The same reference" means the same value. A value defined inside a loop can differ between
+ * iterations, so an overwrite reached through a back edge does not count for such a value.
  */
 public class OverwrittenStoreEliminationPhase extends Phase {
 

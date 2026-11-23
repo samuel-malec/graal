@@ -43,10 +43,10 @@ import jdk.graal.compiler.nodes.java.MethodCallTargetNode;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 /**
- * Applies the analysis to one of the program's methods, right after Native Image's inliners:
- * gives accesses their partitions, and narrows each call, and the entry of its exception handler,
- * to what its callees may write. Inlined code included: a call's kill set belongs to its targets,
- * not to where the call is.
+ * Runs right after Native Image's inliners on each of the program's methods. Gives field accesses
+ * their partitions, and narrows each call (and the entry of its exception handler) to what its
+ * possible callees may write. Inlined code is included: a call's kill set depends on its targets,
+ * not on where the call is.
  */
 final class ApplySideEffectAnalysisPhase extends TimedPhase {
     private final KillSets killSets;
@@ -57,8 +57,8 @@ final class ApplySideEffectAnalysisPhase extends TimedPhase {
     private final CompiledCodeCounts counts;
 
     /**
-     * @param only the methods whose calls are narrowed, by prefix: all if none
-     * @param skip the methods whose calls are not
+     * @param only narrow calls only in methods with these name prefixes; all methods if empty
+     * @param skip don't narrow calls in methods with these prefixes
      */
     ApplySideEffectAnalysisPhase(StepTimes times, KillSets killSets, FieldPartitions partitions, String program, List<String> only, List<String> skip, CompiledCodeCounts counts) {
         super(times, "apply");
@@ -82,17 +82,8 @@ final class ApplySideEffectAnalysisPhase extends TimedPhase {
             if (narrows && node instanceof Invoke invoke && invoke.callTarget() instanceof MethodCallTargetNode target) {
                 LocationIdentity[] locations = killSets.killsOf(target, partitioned);
                 if (locations != null) {
-                    List<LocationIdentity> killed = new ArrayList<>(List.of(locations));
-                    killed.addAll(killSets.killedByEveryCall());
-                    invoke.setKilledLocationIdentities(killed.toArray(new LocationIdentity[0]));
-                    if (invoke instanceof InvokeWithExceptionNode withException && withException.exceptionEdge() instanceof ExceptionObjectNode handler) {
-                        // The handler is entered after the callee threw: before it did, it may
-                        // have written what it writes otherwise.
-                        handler.setKilledLocationIdentities(killed.toArray(new LocationIdentity[0]));
-                    }
-                    LocationIdentity[] set = Invoke.killSet(Arrays.stream(locations).filter(l -> !killSets.isVMState(l)).toArray(LocationIdentity[]::new));
-                    calls.add(String.format("%s kills %s", Names.readableName(target.targetMethod()), set.length == 0 ? "nothing"
-                                    : Arrays.stream(set).map(l -> Names.simpleName(l.toString())).collect(Collectors.joining(" "))));
+                    narrow(invoke, locations);
+                    calls.add(String.format("%s kills %s", Names.readableName(target.targetMethod()), shown(locations)));
                 }
             }
         }
@@ -103,9 +94,25 @@ final class ApplySideEffectAnalysisPhase extends TimedPhase {
         graph.getDebug().dump(DebugContext.BASIC_LEVEL, graph, "After applying the side-effect analysis");
     }
 
-    /**
-     * Whether the calls in a method are narrowed: the only and skip options limit it.
-     */
+    /** Restricts a call, and its exception handler's entry, to what its callees may write plus the VM state. */
+    private void narrow(Invoke invoke, LocationIdentity[] locations) {
+        List<LocationIdentity> killed = new ArrayList<>(List.of(locations));
+        killed.addAll(killSets.killedByEveryCall());
+        invoke.setKilledLocationIdentities(killed.toArray(new LocationIdentity[0]));
+        if (invoke instanceof InvokeWithExceptionNode withException && withException.exceptionEdge() instanceof ExceptionObjectNode handler) {
+            // The handler runs after the callee threw; before throwing, the callee may have written
+            // anything it writes normally.
+            handler.setKilledLocationIdentities(killed.toArray(new LocationIdentity[0]));
+        }
+    }
+
+    /** A call's kill set for counts.txt: short location names, without the VM state. */
+    private String shown(LocationIdentity[] locations) {
+        LocationIdentity[] set = Invoke.killSet(Arrays.stream(locations).filter(l -> !killSets.isVMState(l)).toArray(LocationIdentity[]::new));
+        return set.length == 0 ? "nothing" : Arrays.stream(set).map(l -> Names.simpleName(l.toString())).collect(Collectors.joining(" "));
+    }
+
+    /** Whether calls in this method are narrowed, given the only/skip options. */
     private boolean narrowsIn(ResolvedJavaMethod method) {
         String name = Names.exportName(method);
         return (only.isEmpty() || only.stream().anyMatch(name::startsWith)) && skip.stream().noneMatch(name::startsWith);

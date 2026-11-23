@@ -55,34 +55,31 @@ import com.oracle.graal.pointsto.meta.AnalysisUniverse;
 import com.oracle.graal.pointsto.meta.PointsToAnalysisMethod;
 
 /**
- * The places in the program where a reference moves from one object to another or leaves the analyzed
- * code: stores into fields and arrays, unsafe and handle stores, copies between arrays, clones, and calls.
- * A store, copy or clone becomes a site, which shares what it moves once an object it may move it into has
- * shared contents. A call is described by what the facts say of its callees: it shares its arguments, or
- * links the objects of its arguments, or does nothing.
+ * The places where a reference moves into another object or leaves the analyzed code: field and
+ * array stores, unsafe and VarHandle stores, array copies, clones, and calls. A store, copy or
+ * clone becomes a site that shares what it moves once a target object has shared contents. A call
+ * either shares its arguments, links them (see {@link ThreadEscape}), or does nothing, depending on
+ * what the facts say about its callees.
  */
 final class PublishingSites {
 
     private enum Kind {
         /** Shares what it stores. */
         STORE,
-        /** Shares the contents of what it copies from. */
+        /** Shares the contents of the source it copies from. */
         COPY,
-        /** Shares the contents of the objects of the same exact type that it clones. */
+        /** Shares the contents of the cloned objects of the same exact type. */
         CLONE
     }
 
-    /**
-     * Something stored, or copied, into objects: once the contents of an object it may go into are
-     * shared, what goes into it is.
-     */
+    /** A store, copy or clone into objects: once a target's contents are shared, what goes into it is shared. */
     static final class Site {
         final Kind kind;
         final Supplier<String> what;
         final Held value;
-        /** The field stored into, if it is one. */
+        /** The field stored into, if any. */
         final AnalysisField field;
-        /** The flows the value comes from, kept to explain. */
+        /** The flows the value comes from, for explanations. */
         List<TypeFlow<?>> flows = List.of();
         boolean fired;
 
@@ -94,22 +91,18 @@ final class PublishingSites {
         }
     }
 
-    /**
-     * What is done once every store is known: where a store goes into, when the object stored
-     * into is a saturated flow's, is what the stores into what it loads from say.
-     */
+    /** Deferred until all stores are known: if the target is a saturated flow's, its objects are resolved from the stores into what it loads. */
     record PendingSite(Site site, Held target) {
     }
 
     /**
-     * A call to a method with an effect the facts can't name, as the objects passed to it: for each
-     * argument that is an object, those the analysis knows it may be, or the declared type of a
-     * saturated flow.
+     * A call to a method with an unknown effect, as the objects passed to it: per object argument,
+     * the objects the analysis knows it may be, or the declared type if its flow saturated.
      */
     private static final class Call {
         final String callee;
         final List<Held> arguments = new ArrayList<>();
-        /** Whether the objects of this argument were shared for another one being. */
+        /** Whether this argument's objects were already shared because another argument was. */
         final List<Boolean> spread = new ArrayList<>();
 
         Call(String callee) {
@@ -117,9 +110,16 @@ final class PublishingSites {
         }
     }
 
+    /** An object passed to a linking call, at an argument position. */
     record Link(Call call, int position) {
     }
 
+    /** Natives of Object and Class that store no reference (see {@link #isPure}). */
+    private static final Set<String> PURE_OBJECT = Set.of("getClass", "hashCode", "notify", "notifyAll", "wait0", "wait");
+    private static final Set<String> PURE_CLASS = Set.of("isInstance", "isAssignableFrom", "isInterface", "isArray", "isPrimitive", "isHidden", "isRecord", "isAnnotation", "isEnum", "getModifiers",
+                    "getSuperclass", "getComponentType", "getName", "desiredAssertionStatus");
+
+    // Shared with the thread-escape run these sites belong to.
     private final ThreadEscape escape;
     private final PointsToAnalysis bb;
     private final AnalysisUniverse universe;
@@ -132,27 +132,33 @@ final class PublishingSites {
     StoredPlaces places;
     SharingExplanation why;
 
+    /** How completely the facts describe each method. */
     final Function<AnalysisMethod, Described> described;
 
-    /** Whether the graphs are about to be compiled, so that a call without targets never happens. */
+    /** Whether the graphs will be compiled, so a call without targets can never execute. */
     final boolean compiled;
 
+    /** What the export found that the flows don't show: unmodeled stores and calls into unseen code. */
     final List<UnsafeStore> unsafeStores;
     final List<OpaqueCall> opaqueCalls;
+
+    /** Sites created but not yet attached to their target objects (see {@link #register}). */
     final List<PendingSite> pendingSites = new ArrayList<>();
+
+    /** Sites by the objects they may store into. */
     final Map<AnalysisObject, List<Site>> sitesByObject = new HashMap<>();
 
-    /** The sites that may go into any object of a type: their flow saturated. */
+    /** Sites whose target flow saturated, by the type of objects they may store into. */
     final Map<AnalysisType, List<Site>> sitesByType = new HashMap<>();
 
-    int storeSites;
-    int copySites;
+    /** Linking calls, by the objects passed to them and by the types of saturated arguments. */
     final Map<AnalysisObject, List<Link>> links = new HashMap<>();
     final Map<AnalysisType, List<Link>> linksByType = new HashMap<>();
+
+    // Counts for the diagnostics.
+    int storeSites;
+    int copySites;
     int linkedCalls;
-    private static final Set<String> PURE_OBJECT = Set.of("getClass", "hashCode", "notify", "notifyAll", "wait0", "wait");
-    private static final Set<String> PURE_CLASS = Set.of("isInstance", "isAssignableFrom", "isInterface", "isArray", "isPrimitive", "isHidden", "isRecord", "isAnnotation", "isEnum", "getModifiers",
-                    "getSuperclass", "getComponentType", "getName", "desiredAssertionStatus");
 
     PublishingSites(ThreadEscape escape, Function<AnalysisMethod, Described> described, boolean compiled, List<UnsafeStore> unsafeStores, List<OpaqueCall> opaqueCalls) {
         this.escape = escape;
@@ -169,66 +175,76 @@ final class PublishingSites {
         this.opaqueCalls = opaqueCalls;
     }
 
+    /** Connects the sites to the other parts of thread escape, created after them. */
     void connect(FlowReader reader, StoredPlaces places, SharingExplanation why) {
         this.reader = reader;
         this.places = places;
         this.why = why;
     }
 
-    /**
-     * The sites a flow is: a store into an object, a copy between arrays, a clone. What the
-     * flow stores is shared once the contents of an object it may be stored into are.
-     */
+    /** The sites for a flow: a store, an array copy or a clone. What it stores is shared once a target's contents are. */
     void sites(AnalysisMethod method, TypeFlow<?> flow) {
         if (escape.inVirtualMachine(method)) {
-            // The virtual machine's code stores where it reads, but not into the objects of the JDK and the program that others read.
+            // Under vm-code, VM code stores only where VM code reads, except into JDK and program objects, which others read.
             AnalysisField stored = flow instanceof StoreFieldTypeFlow store ? store.field() : null;
             if (stored == null || stored.getDeclaringClass().toJavaName(true).startsWith(ThreadEscape.VM)) {
                 return;
             }
         }
         if (flow instanceof StoreFieldTypeFlow.StoreStaticFieldTypeFlow store) {
-            // Every thread reaches a static field.
+            // Every thread can reach a static field.
             if (store.valueFlow() != null && !escape.isPrivate(store.field()) && !ThreadEscape.LEAVE_OUT.contains("static")) {
-                afterCollection.add(() -> {
-                    why.because(() -> "a store into the static field " + store.field().format("%H.%n") + " in " + method.format("%H.%n"), null);
-                    Held stored = reader.held(store.valueFlow(), true);
-                    if (explain != null && explain.matcher(store.field().format("%H.%n")).find()) {
-                        PointsToExport.diagnostics().println("THREADESCAPE a store into the static field " + store.field().format("%H.%n") + " shares " + why.describe(stored) + " " + why.summary(stored));
-                        for (FlowReader.Source source : stored.stored()) {
-                            if (source.key() instanceof TypeFlow<?> saturated) {
-                                Held rebuilt = reader.rebuild(saturated);
-                                PointsToExport.diagnostics().println("THREADESCAPE   the saturated " + GraphExport.simpleClassName(saturated) + " of declared type " + saturated.getDeclaredType() +
-                                                " (filters " + source.filters() + ") is rebuilt as " +
-                                                why.describe(rebuilt) + " " + why.summary(rebuilt));
-                            }
-                        }
-                    }
-                    escape.share(stored);
-                });
+                afterCollection.add(() -> shareStaticStore(method, store));
                 storeSites++;
             }
         } else if (flow instanceof StoreFieldTypeFlow.StoreInstanceFieldTypeFlow store && store.valueFlow() != null && !escape.isPrivate(store.field()) && !ThreadEscape.LEAVE_OUT.contains("field")) {
             site(Kind.STORE, () -> "a store into " + store.field().format("%H.%n") + " in " + method.format("%H.%n"), reader.observedBy(store, store.receiver()), store.valueFlow(), store.field());
         } else if (flow instanceof OffsetStoreTypeFlow store && store.valueFlow() != null && !isStoreApi(method) && !ThreadEscape.LEAVE_OUT.contains("array")) {
             boolean indexed = store instanceof OffsetStoreTypeFlow.StoreIndexedTypeFlow;
-            site(Kind.STORE, () -> "a " + (indexed ? "store into an array" : "unsafe store") + " in " + method.format("%H.%n"), reader.held(reader.observedBy(store, store.receiver()), true), reader.held(store.valueFlow(), true), null,
+            site(Kind.STORE, () -> "a " + (indexed ? "store into an array" : "unsafe store") + " in " + method.format("%H.%n"), reader.held(reader.observedBy(store, store.receiver()), true), reader
+                            .held(store.valueFlow(), true), null,
                             List.of(store.valueFlow()), !indexed, true);
-            if (!(store instanceof OffsetStoreTypeFlow.StoreIndexedTypeFlow) && !readFlows && !bb.analysisPolicy().useConservativeUnsafeAccess() && !universe.getUnsafeAccessedStaticFields().isEmpty()) {
-                // The analysis lets an unsafe store write a static field, whatever the object it stores into; its base is the array that holds statics.
-                Held base = reader.held(reader.observedBy(store, store.receiver()), true);
-                if (base.isNothing() || !base.any().isEmpty() || FlowReader.hasArray(base.objectsIn(bb))) {
-                    afterCollection.add(() -> {
-                        why.because(() -> "an unsafe store in " + method.format("%H.%n") + ", which may write a static field", null);
-                        escape.share(reader.held(store.valueFlow(), true));
-                    });
-                }
+            if (!indexed && !readFlows && !bb.analysisPolicy().useConservativeUnsafeAccess() && !universe.getUnsafeAccessedStaticFields().isEmpty()) {
+                unsafeStoreIntoStatics(method, store);
             }
         } else if (flow instanceof ArrayCopyTypeFlow copy && !ThreadEscape.LEAVE_OUT.contains("copy")) {
             site(Kind.COPY, () -> "a copy between arrays in " + method.format("%H.%n"), copy.destination(), copy.source(), null);
         } else if (flow instanceof CloneTypeFlow clone && bb.analysisPolicy().allocationSiteSensitiveHeap()) {
-            // Without allocation sites, a clone is the same abstract object as what it clones, and has its flows.
+            // Without allocation sites, a clone is the same abstract object as its original and shares its flows.
             site(Kind.CLONE, () -> "a clone in " + method.format("%H.%n"), clone, reader.observedBy(clone, clone.input()), null);
+        }
+    }
+
+    /** A static store shares what it stores, since every thread can reach it. */
+    private void shareStaticStore(AnalysisMethod method, StoreFieldTypeFlow.StoreStaticFieldTypeFlow store) {
+        why.because(() -> "a store into the static field " + store.field().format("%H.%n") + " in " + method.format("%H.%n"), null);
+        Held stored = reader.held(store.valueFlow(), true);
+        if (explain != null && explain.matcher(store.field().format("%H.%n")).find()) {
+            PointsToExport.diagnostics().println("THREADESCAPE a store into the static field " + store.field().format("%H.%n") + " shares " + why.describe(stored) + " " + why.summary(stored));
+            for (FlowReader.Source source : stored.stored()) {
+                if (source.key() instanceof TypeFlow<?> saturated) {
+                    Held rebuilt = reader.rebuild(saturated);
+                    PointsToExport.diagnostics().println("THREADESCAPE   the saturated " + GraphExport.simpleClassName(saturated) + " of declared type " + saturated.getDeclaredType() +
+                                    " (filters " + source.filters() + ") is rebuilt as " +
+                                    why.describe(rebuilt) + " " + why.summary(rebuilt));
+                }
+            }
+        }
+        escape.share(stored);
+    }
+
+    /**
+     * The analysis lets an unsafe store write a static field whatever its target; the base of such a
+     * store is the array holding the statics. A store whose base may be that array shares what it
+     * stores.
+     */
+    private void unsafeStoreIntoStatics(AnalysisMethod method, OffsetStoreTypeFlow store) {
+        Held base = reader.held(reader.observedBy(store, store.receiver()), true);
+        if (base.isNothing() || !base.any().isEmpty() || FlowReader.hasArray(base.objectsIn(bb))) {
+            afterCollection.add(() -> {
+                why.because(() -> "an unsafe store in " + method.format("%H.%n") + ", which may write a static field", null);
+                escape.share(reader.held(store.valueFlow(), true));
+            });
         }
     }
 
@@ -237,8 +253,11 @@ final class PublishingSites {
     }
 
     /**
-     * @param unsafe whether the store is an unsafe or a handle's, which may be into a field
-     * @param array whether it is into an array for sure; otherwise whether it may be
+     * Creates a site for a store, copy or clone, and records the stored value under its target place
+     * for saturated loads that read from there.
+     *
+     * @param unsafe whether it is an unsafe or VarHandle store, which may target a field
+     * @param array whether it certainly targets an array; otherwise whether it may
      */
     private void site(Kind kind, Supplier<String> what, Held target, Held stored, AnalysisField field, List<TypeFlow<?>> flows, boolean unsafe, boolean array) {
         boolean isArrayStore = array && (!unsafe || reader.mayBeArray(target));
@@ -255,14 +274,16 @@ final class PublishingSites {
                     why.arrayStoresOfAny.add(what.get() + "  stores " + why.summary(stored));
                 }
             }
-            if (field == null && !isArrayStore || field == null && unsafe) {
+            if (field == null && (!isArrayStore || unsafe)) {
+                // It may target a field accessed through unsafe.
                 places.storedUnsafely.add(stored);
             }
         }
         if (explain != null) {
             site.flows = flows;
             if (explain.matcher(what.get()).find()) {
-                PointsToExport.diagnostics().println("THREADESCAPE site (" + kind + ") " + what.get() + "\n    into " + why.describe(target) + " " + why.summary(target) + "\n    value " + why.describe(stored) + " " + why.summary(stored));
+                PointsToExport.diagnostics().println("THREADESCAPE site (" + kind + ") " + what.get() + "\n    into " + why.describe(target) + " " + why.summary(target) + "\n    value " + why
+                                .describe(stored) + " " + why.summary(stored));
             }
         }
         if (kind == Kind.STORE) {
@@ -273,7 +294,7 @@ final class PublishingSites {
         pendingSites.add(new PendingSite(site, target));
     }
 
-    /** Registers a site under the objects it may go into, once the stores that tell what a saturated target holds are known. */
+    /** Attaches a site to its target objects, once all stores (and so all saturated targets) are known. */
     void register(Site site, Held rawTarget) {
         Held target = places.expand(rawTarget);
         if (explain != null && explain.matcher(site.what.get()).find()) {
@@ -284,11 +305,12 @@ final class PublishingSites {
                     names.append(GraphExport.PointsTo.objectName(object)).append("; ");
                 }
             }
-            PointsToExport.diagnostics().println("THREADESCAPE registered " + site.what.get() + " into " + count + " objects: " + names + " any " + target.any().stream().map(AnalysisType::toJavaName).toList() + " from " + why.summary(rawTarget));
+            PointsToExport.diagnostics().println("THREADESCAPE registered " + site.what.get() + " into " + count + " objects: " + names + " any " + target.any().stream().map(AnalysisType::toJavaName)
+                            .toList() + " from " + why.summary(rawTarget));
         }
         for (AnalysisObject object : target.objectsIn(bb)) {
             if (site.kind != Kind.CLONE && object.isEmptyObjectArrayConstant(bb)) {
-                // Nothing can be stored into an array without elements.
+                // Nothing can be stored into an array type without elements.
                 continue;
             }
             sitesByObject.computeIfAbsent(object, k -> new ArrayList<>(2)).add(site);
@@ -298,7 +320,7 @@ final class PublishingSites {
         }
     }
 
-    /** A store the analysis models by nothing: a site into what it stores into, or a store into who knows what. */
+    /** An unmodeled store: a site on its target objects, or, if the target is unknown, a store into anything. */
     void unsafeStore(UnsafeStore store) {
         if (escape.inVirtualMachine(store.method()) || isStoreApi(store.method())) {
             return;
@@ -320,7 +342,7 @@ final class PublishingSites {
         }
     }
 
-    /** What the flows of a method may hold, over every context the method was analysed in. */
+    /** What a method's flows may hold, over every context the method was analyzed in. */
     Held heldOf(PointsToAnalysisMethod method, List<TypeFlow<?>> originals) {
         Held held = Held.NOTHING;
         for (TypeFlow<?> original : originals) {
@@ -336,9 +358,8 @@ final class PublishingSites {
     }
 
     /**
-     * What a call does with its arguments, by what the facts say of its callees. A method the
-     * facts don't have may share them and what it returns; a method with an effect the facts
-     * can't name links the objects of different arguments.
+     * What a call does with its arguments, from the facts about its callees. A method without facts
+     * may share them and its result; a method with an unknown effect links its arguments.
      */
     void call(AnalysisMethod caller, InvokeTypeFlow invoke) {
         Collection<AnalysisMethod> callees = invoke.getOriginalCallees();
@@ -349,7 +370,7 @@ final class PublishingSites {
         AnalysisMethod unknown = null;
         for (AnalysisMethod callee : callees) {
             if (isStoreApi(callee) || isPure(callee)) {
-                // What it does is known: it stores where its arguments say, or nowhere.
+                // Its effects are known: it stores where its arguments say, or nowhere.
                 continue;
             }
             switch (described.apply(callee)) {
@@ -368,22 +389,26 @@ final class PublishingSites {
         }
     }
 
-    /** A call to a method the facts don't have: its arguments and its result are shared. */
+    /** A call to a method without facts: its arguments and result are shared. */
     private void shareOpaqueCall(AnalysisMethod caller, InvokeTypeFlow invoke, AnalysisMethod culprit) {
         for (TypeFlow<?> argument : invoke.getActualParameters()) {
             if (argument != null) {
-                why.because(() -> "argument of a call in " + caller.format("%H.%n") + " to " + (culprit == null ? "a method without targets" : culprit.format("%H.%n") + ", which the facts don't have") +
-                                (argument.isSaturated() ? " (saturated flow)" : ""), null);
+                why.because(() -> "argument of a call in " + caller.format("%H.%n") + " to " + opaqueCallee(culprit) + (argument.isSaturated() ? " (saturated flow)" : ""), null);
                 escape.share(reader.held(argument, true));
             }
         }
         if (invoke.getActualReturn() != null) {
-            why.because(() -> "result of a call in " + caller.format("%H.%n") + " to " + (culprit == null ? "a method without targets" : culprit.format("%H.%n") + ", which the facts don't have"), null);
+            why.because(() -> "result of a call in " + caller.format("%H.%n") + " to " + opaqueCallee(culprit), null);
             escape.share(reader.held(invoke.getActualReturn(), true));
         }
     }
 
-    /** A call to a method with an effect the facts can't name: the objects of different arguments are linked. */
+    /** The callee of a call to a method without facts, for explanations. */
+    private static String opaqueCallee(AnalysisMethod culprit) {
+        return culprit == null ? "a method without targets" : culprit.format("%H.%n") + ", which the facts don't have";
+    }
+
+    /** A call to a method with an unknown effect: its arguments are linked. */
     private void linkCall(AnalysisMethod caller, InvokeTypeFlow invoke, AnalysisMethod unknown) {
         Call call = new Call(unknown.format("%H.%n") + " in " + caller.format("%H.%n"));
         for (TypeFlow<?> argument : invoke.getActualParameters()) {
@@ -413,10 +438,9 @@ final class PublishingSites {
     }
 
     /**
-     * Whether a method stores a reference at an offset in the object it is given, as the
-     * unsafe and variable handle accessors do. Their bodies are one for every field and every
-     * object, so what they say about what is stored where merges every call; the arguments of
-     * each call say it exactly.
+     * Whether a method stores a reference at an offset into its argument, like the unsafe and
+     * VarHandle accessors. Their one body serves every field and object, so its flows merge all
+     * calls; each call's own arguments say exactly what goes where.
      */
     private static boolean isStoreApi(AnalysisMethod method) {
         String owner = method.getDeclaringClass().toJavaName(true);
@@ -428,9 +452,9 @@ final class PublishingSites {
     }
 
     /**
-     * Whether a method the facts don't have stores no reference and gives back none it wasn't
-     * given: the natives of Object and Class that read an object or its class, and the identity
-     * hash code. Their behavior is fixed by the language.
+     * Whether a method without facts stores no reference and returns none it wasn't given: the
+     * natives of Object and Class that read an object or its class, and the identity hash code. The
+     * language fixes their behavior.
      */
     private static boolean isPure(AnalysisMethod method) {
         String owner = method.getDeclaringClass().toJavaName(true);
@@ -440,9 +464,9 @@ final class PublishingSites {
     }
 
     /**
-     * A call to a store accessor stores its last object argument into its first, after the
-     * accessor's own, the handle or the unsafe object; with only one, a static field's, it
-     * stores it where every thread reaches.
+     * A call to a store accessor stores its last object argument into its first one (after the
+     * accessor's own receiver, the handle or the Unsafe object). With only one object argument it is a
+     * static store, which every thread can reach.
      */
     private void storeApi(AnalysisMethod caller, InvokeTypeFlow invoke) {
         List<TypeFlow<?>> objects = new ArrayList<>();
@@ -464,7 +488,7 @@ final class PublishingSites {
         }
     }
 
-    /** The contents of an object a site may go into are shared: what it stores is shared, what it copies from has its contents shared. */
+    /** A target's contents became shared: share what the site stores, or the contents of what it copies from. */
     void fire(Site site, AnalysisObject object) {
         switch (site.kind) {
             case STORE -> {
@@ -482,7 +506,7 @@ final class PublishingSites {
                 }
             }
             case CLONE -> {
-                // A clone has the type of what it clones.
+                // A clone has the type of the original.
                 AnalysisType type = object.type();
                 why.because(() -> site.what.get() + ", and the contents of " + GraphExport.PointsTo.objectName(object) + " are shared", object);
                 Held cloning = places.expand(site.value);
@@ -504,6 +528,7 @@ final class PublishingSites {
         }
     }
 
+    /** An object passed to a linking call became shared: share the call's other arguments, once each. */
     void spread(Link link, AnalysisObject object) {
         Call call = link.call();
         for (int other = 0; other < call.arguments.size(); other++) {

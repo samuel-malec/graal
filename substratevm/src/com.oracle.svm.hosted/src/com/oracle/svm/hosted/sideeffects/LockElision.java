@@ -48,25 +48,15 @@ import jdk.graal.compiler.nodes.java.MonitorExitNode;
 import jdk.graal.compiler.nodes.java.MonitorIdNode;
 import jdk.graal.compiler.nodes.util.GraphUtil;
 
-/**
- * The monitors and volatile accesses on objects only one thread reaches, as the tool decides them
- * (effects.elide, locks.txt), and how many of them the image lost.
- */
+/** Removes locks and makes volatile accesses plain on objects only one thread can reach, as the tool decides (effects.elide, locks.txt), and counts what was removed. */
 final class LockElision {
-    /**
-     * Where a monitor the tool says can go is -> enter or exit; where a volatile access that can
-     * be made ordinary is -> plain-read or plain-write, a tab, and its field.
-     */
+    /** Position of a removable lock to enter/exit; position of a volatile access that can be plain to plain-read/plain-write, a tab, and its field. */
     private final Map<String, String> decisions = new HashMap<>();
-    /**
-     * Control: a method, as the export names it, whose monitors and volatile accesses are claimed
-     * to be on objects only one thread reaches.
-     */
+    /** Test only: a method (as the export names it) whose locks and volatile accesses are claimed to be thread-local. */
     private final String claimedLocal;
-    /**
-     * Control: remove the monitors even in an image that can deoptimize.
-     */
+    /** Test only: remove locks even in an image that can deoptimize. */
     private final boolean claimNoDeoptimization;
+    // What was removed, summed over the compiler threads, for timings.txt.
     private final AtomicInteger monitorsRemoved = new AtomicInteger();
     private final AtomicInteger locksRemoved = new AtomicInteger();
     private final AtomicInteger locksKeptForDeoptimization = new AtomicInteger();
@@ -77,7 +67,7 @@ final class LockElision {
         this.claimNoDeoptimization = claimNoDeoptimization;
     }
 
-    /** Reads the tool's decisions: where a node is, a tab, and what to do with it. */
+    /** Reads the tool's decisions: per line a position, a tab, and the decision. */
     void read(Path locks) throws IOException {
         for (String line : Files.readAllLines(locks)) {
             String[] parts = line.split("\t", 2);
@@ -85,37 +75,33 @@ final class LockElision {
         }
     }
 
-    /** Appends to timings.txt how many locks and volatile accesses the image lost, of how many listed. */
+    /** Appends to timings.txt how many locks and volatile accesses were removed, of how many listed. */
     void appendTo(StringBuilder timings) {
         timings.append(String.format("# locks removed: %d, with %d monitor enters and exits; volatile accesses made ordinary: %d; of %d sites the tool listed%n", locksRemoved.get(),
                         monitorsRemoved.get(), volatilesMadePlain.get(), decisions.size()));
         timings.append(String.format("# locks kept because the image can deoptimize: %d%n", locksKeptForDeoptimization.get()));
     }
 
-    /** The phase that removes the monitors and makes the volatile accesses ordinary. */
+    /** Creates the phase that removes locks and makes volatile accesses plain. */
     TimedPhase newPhase(StepTimes times, CompiledCodeCounts counts) {
         return new ElideLocksPhase(times, counts);
     }
 
-    /**
-     * Whether the tool lists a node at {@code at} with this decision, or the control claims every
-     * monitor and volatile access of its method local.
-     */
+    /** Whether the tool lists a node at {@code at} with this decision, or the test claim covers its method. */
     private boolean listedOrClaimed(String at, String decision) {
         return Names.sitesOf(at).stream().anyMatch(site -> decision.equals(decisions.get(site)) || !claimedLocal.isEmpty() && site.startsWith(claimedLocal + ":"));
     }
 
     /**
-     * Removes the monitor enters and exits the tool says are on objects only one thread reaches, in
-     * every method, inlined code included. A lock goes whole or not at all: its enter and every
-     * exit, the ones on the paths that throw too, must all be listed, or the frame states and the
-     * monitors left would not match. Positions need -H:+TrackNodeSourcePosition.
+     * Removes the lock enters and exits that the tool lists, in every method, inlined code included.
+     * A lock is removed entirely or not at all: its enter and every exit (including those on
+     * exception paths) must be listed, or the frame states and remaining monitors would not match.
+     * Positions need -H:+TrackNodeSourcePosition.
      * <p>
-     * An image that can deoptimize keeps its monitors. Code compiled while the program runs does
-     * not pass through this phase and takes the locks it finds; when it is deoptimized inside a
-     * locked region, its frame goes on in the version of the method the image was built with, and
-     * that version must release the lock the compiled code took. Without its monitors it would not,
-     * and the thread would hold the lock for good. The volatile accesses are not affected.
+     * An image that can deoptimize keeps its locks. Code compiled at run time doesn't go through this
+     * phase and takes the locks. If it deoptimizes inside a locked region, execution continues in the
+     * image's version of the method, which must release that lock; without its monitors it wouldn't,
+     * and the thread would hold the lock forever. Volatile accesses are not affected.
      */
     private final class ElideLocksPhase extends TimedPhase {
         private final CompiledCodeCounts counts;
@@ -156,10 +142,7 @@ final class LockElision {
             }
         }
 
-        /**
-         * A volatile access of a field the tool says only one thread reaches orders nothing: it
-         * becomes an ordinary one.
-         */
+        /** Makes listed volatile accesses plain: on an object only one thread can reach, they synchronize with nothing. */
         private void makeVolatilesPlain(StructuredGraph graph, List<String> report) {
             for (AccessFieldNode access : graph.getNodes().filter(AccessFieldNode.class).snapshot()) {
                 if (access.getMemoryOrder() != MemoryOrderMode.VOLATILE) {
@@ -178,6 +161,7 @@ final class LockElision {
             }
         }
 
+        /** Whether the tool lists a lock enter or exit, or the test claim covers it. */
         private boolean listed(AccessMonitorNode monitor) {
             String kind = monitor instanceof MonitorEnterNode && !(monitor instanceof OSRMonitorEnterNode) ? "enter" : monitor instanceof MonitorExitNode ? "exit" : null;
             String at = PointsToExport.position(monitor.getNodeSourcePosition());

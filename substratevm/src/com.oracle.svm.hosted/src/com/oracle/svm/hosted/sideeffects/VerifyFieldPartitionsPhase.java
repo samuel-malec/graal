@@ -36,9 +36,9 @@ import jdk.graal.compiler.nodes.memory.MemoryAccess;
 import jdk.vm.ci.meta.ResolvedJavaField;
 
 /**
- * Stops the build if a graph has accesses to one field both with and without a partition, as a
- * phase that makes a new access after the partitioning could: their locations would not overlap,
- * and nothing would order them.
+ * Fails the build if a graph accesses one field both with and without a partition, as a phase
+ * creating new accesses after partitioning could cause. Such locations would never overlap, so
+ * nothing would order those accesses.
  */
 final class VerifyFieldPartitionsPhase extends TimedPhase {
     VerifyFieldPartitionsPhase(StepTimes times) {

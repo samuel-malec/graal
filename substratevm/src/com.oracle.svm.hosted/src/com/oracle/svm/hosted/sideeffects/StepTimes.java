@@ -31,32 +31,26 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
- * What each step of the analysis cost in this build, in nanoseconds, and how often it ran: the
- * export and the tool once, each phase once per graph, summed over the compiler's threads. Written
- * to timings.txt, with the size of the export.
+ * The time each step of the analysis took in this build, in nanoseconds, and how often it ran: the
+ * export and the tool once, each phase once per graph, summed over the compiler threads. Written
+ * to timings.txt together with the export's size.
  */
 final class StepTimes {
     private final Map<String, LongAdder> nanos = new ConcurrentHashMap<>();
     private final Map<String, LongAdder> runs = new ConcurrentHashMap<>();
 
-    /**
-     * Adds the time since {@code start} to a step of the analysis.
-     */
+    /** Adds the time since {@code start} to a step. */
     void time(String step, long start) {
         add(step, System.nanoTime() - start);
     }
 
-    /**
-     * Adds one run of a step that took this long.
-     */
+    /** Adds one run of a step that took this long. */
     void add(String step, long stepNanos) {
         nanos.computeIfAbsent(step, k -> new LongAdder()).add(stepNanos);
         runs.computeIfAbsent(step, k -> new LongAdder()).increment();
     }
 
-    /**
-     * Appends a line for each step, in the order of their names: the step, its seconds, its runs.
-     */
+    /** Appends one line per step, sorted by name: the step, its seconds and its runs. */
     void appendTo(StringBuilder timings) {
         for (Map.Entry<String, LongAdder> step : new TreeMap<>(nanos).entrySet()) {
             timings.append(String.format(Locale.ROOT, "%s\t%.3f\t%d%n", step.getKey(), step.getValue().sum() / 1e9, runs.get(step.getKey()).sum()));

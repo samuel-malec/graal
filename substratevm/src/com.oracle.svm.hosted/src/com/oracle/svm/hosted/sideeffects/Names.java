@@ -35,34 +35,28 @@ import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
 /**
- * How the side-effect analysis names methods, fields and the places of nodes: as the export and
- * the tool name them, to look up what the tool says, and shorter, for the counts.
+ * Names for methods, fields and node positions: the export's names, to look things up in the
+ * tool's output, and shorter names for the counts.
  */
 final class Names {
 
     private Names() {
     }
 
-    /**
-     * Whether a method belongs to the program that {@code program} names, as
-     * {@link PointsToExport#isProgramClass(String, String)} takes it.
-     */
+    /** Whether a method is part of the program, as {@link PointsToExport#isProgramClass(String, String)} decides. */
     static boolean inProgram(ResolvedJavaMethod method, String program) {
         return PointsToExport.isProgramClass(method.getDeclaringClass().toJavaName(true), program);
     }
 
     /**
-     * A method as the export names it: LoadStoreElimination.length(LLoadStoreElimination$Link;)I,
-     * with a lambda's class named by its content, as the tool's answers name it, not by the address
-     * the build gave it.
+     * A method's name in the export, e.g. {@code LoadStoreElimination.length(LLoadStoreElimination$Link;)I}.
+     * Lambda classes are named by content, not by the address this build gave them.
      */
     static String exportName(ResolvedJavaMethod method) {
         return PointsToExport.methodKey(method);
     }
 
-    /**
-     * A method as the counts name it, for reading: LoadStoreElimination.length(Link).
-     */
+    /** A method's short name in the counts, e.g. {@code LoadStoreElimination.length(Link)}. */
     static String readableName(ResolvedJavaMethod method) {
         String parameters = IntStream.range(0, method.getSignature().getParameterCount(false))
                         .mapToObj(i -> simpleName(method.getSignature().getParameterType(i, null).toJavaName(true)))
@@ -70,30 +64,28 @@ final class Names {
         return method.getDeclaringClass().toJavaName(false) + "." + method.getName() + "(" + parameters + ")";
     }
 
-    /** A field as the export names it: Aliasing$Counter.value, a lambda's class by its content. */
+    /** A field's name in the export, e.g. {@code Aliasing$Counter.value}; lambda classes by content. */
     static String fieldName(ResolvedJavaField field) {
         return PointsToExport.fieldName(field);
     }
 
-    /** A class's name without its package and the classes it is nested in. */
+    /** A class name without its package and enclosing classes. */
     static String simpleName(String name) {
         return name.substring(Math.max(name.lastIndexOf('.'), name.lastIndexOf('$')) + 1);
     }
 
-    /**
-     * A field as the reports name it: Aliasing$Counter.value is Counter.value.
-     */
+    /** A field's short name in reports: {@code Aliasing$Counter.value} becomes {@code Counter.value}. */
     static String shortField(String field) {
         int dot = field.lastIndexOf('.');
         return simpleName(field.substring(0, dot)) + field.substring(dot);
     }
 
     /**
-     * The sites a node at {@code position} may be named by in the analysis's facts: its own, then
-     * the same without each outermost caller in turn. A site names a node of the graph the facts
-     * were taken from, innermost frame first (m:21 in c:4); inlining a copy of that graph into a
-     * caller appends the caller's frame (m:21 in c:4 in h:7). A fact that holds in a graph holds
-     * in every copy of it: an access's partition covers every context it is reached in.
+     * The positions under which facts about a node at {@code position} may be recorded: the full
+     * position, then the same with the outermost caller removed, one at a time. A position lists
+     * frames innermost first ({@code m:21 in c:4}); inlining that graph into a caller appends the
+     * caller's frame ({@code m:21 in c:4 in h:7}). A fact about a graph holds in every copy of it, so
+     * a shorter match is still valid.
      */
     static List<String> sitesOf(String position) {
         List<String> sites = new ArrayList<>();

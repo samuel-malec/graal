@@ -75,9 +75,9 @@ public final class ExceptionObjectNode extends BeginStateSplitNode implements Lo
     private boolean unconditionallyMarkForDeletion;
 
     /**
-     * What the handler's entry kills, a canonical {@link Invoke#killSet}: by default all of memory,
-     * as the call that threw may have written anything before it did. Narrowed to what the call's
-     * callees may write, when the call is.
+     * The memory the handler's entry kills, normalized by {@link Invoke#killSet}. By default all
+     * of memory, because the call that threw may have written anything first. When that call's kill
+     * set is narrowed, this gets the same set.
      */
     private LocationIdentity[] killedLocations = Invoke.KILLS_ANY;
 
@@ -100,8 +100,8 @@ public final class ExceptionObjectNode extends BeginStateSplitNode implements Lo
     }
 
     /**
-     * Narrows what the handler's entry kills to the locations the call that threw may write. With
-     * none it is no memory kill at all, with one a single kill, and with two or more a multi kill.
+     * Restricts the memory the handler's entry kills to what the throwing call may write. An empty
+     * set kills nothing, one location is a single kill, two or more a multi kill.
      */
     public void setKilledLocationIdentities(LocationIdentity... locations) {
         this.killedLocations = Invoke.killSet(locations);
